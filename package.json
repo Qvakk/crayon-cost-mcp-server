@@ -1,0 +1,47 @@
+{
+  "name": "crayon-cost-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Crayon CloudIQ cost and billing APIs with HTTP transport",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js",
+    "watch": "tsc --watch",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "crayon",
+    "cloudiq",
+    "cost",
+    "billing",
+    "azure"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "express": "^4.21.2",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
+    "jsonwebtoken": "^9.0.2",
+    "joi": "^17.13.3",
+    "winston": "^3.13.0",
+    "opossum": "^8.1.0",
+    "express-rate-limit": "^7.2.0",
+    "rate-limit-redis": "^4.2.0",
+    "redis": "^4.7.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.2",
+    "@types/jsonwebtoken": "^9.0.7",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
