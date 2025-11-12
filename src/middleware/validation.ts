@@ -170,39 +170,6 @@ export const schemas = {
   get_last_month_costs_by_tags: Joi.object({
     organizationId: positiveInteger,
   }),
-
-  // Visualization tools
-  visualize_costs_pie_chart: Joi.object({
-    organizationId: Joi.number().integer().positive().required(),
-    monthsBack: Joi.number().integer().min(1).max(24).default(3),
-    topN: Joi.number().integer().min(1).max(50).default(10),
-    chartStyle: Joi.string().valid('pie', 'doughnut').default('pie'),
-  }),
-
-  visualize_cost_trends: Joi.object({
-    organizationId: positiveInteger,
-    monthsBack: Joi.number().integer().min(1).max(24).default(6),
-    compareSubscriptions: Joi.boolean().default(false),
-  }),
-
-  visualize_cost_comparison: Joi.object({
-    organizationId: positiveInteger,
-    compareBy: Joi.string().valid('subscriptions', 'months', 'tags').required(),
-    monthsBack: Joi.number().integer().min(1).max(24).default(3),
-    topN: Joi.number().integer().min(1).max(50).default(10),
-  }),
-
-  visualize_cost_by_tags: Joi.object({
-    organizationId: positiveInteger,
-    monthsBack: Joi.number().integer().min(1).max(24).default(3),
-    stacked: Joi.boolean().default(false),
-  }),
-
-  visualize_anomalies: Joi.object({
-    organizationId: positiveInteger,
-    monthsBack: Joi.number().integer().min(1).max(24).default(3),
-    threshold: Joi.number().min(1).max(100).default(25),
-  }),
 };
 
 /**

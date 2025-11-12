@@ -3,6 +3,7 @@
 // For Windows dev, use Docker or install Visual Studio Build Tools
 import { ChartJSNodeCanvas } from 'chartjs-node-canvas';
 import type { ChartConfiguration } from 'chart.js';
+import { getCurrentLocale } from './localization.js';
 
 /**
  * Chart Generator Utility
@@ -14,6 +15,25 @@ export class ChartGenerator {
   private width: number;
   private height: number;
   private chartJSNodeCanvas: ChartJSNodeCanvas;
+  private locale = getCurrentLocale();
+
+  // Localized strings
+  private labels = {
+    en: {
+      timePeriod: 'Time Period',
+      amount: 'Amount',
+      value: 'Value',
+      cost: 'Cost',
+      percentage: 'Percentage'
+    },
+    no: {
+      timePeriod: 'Tidsperiode',
+      amount: 'Beløp',
+      value: 'Verdi',
+      cost: 'Kostnad',
+      percentage: 'Prosent'
+    }
+  };
 
   constructor(width: number = 800, height: number = 600) {
     this.width = width;
@@ -26,6 +46,10 @@ export class ChartGenerator {
         ChartJS.defaults.font.family = 'DejaVu Sans, Liberation Sans, sans-serif';
       }
     });
+  }
+
+  private getLabel(key: keyof typeof this.labels.en): string {
+    return this.labels[this.locale][key];
   }
 
   /**
@@ -152,8 +176,9 @@ export class ChartGenerator {
     labels: string[], 
     datasets: Array<{ label: string; data: number[]; backgroundColor?: string }>,
     title: string,
-    yAxisLabel: string = 'Amount'
+    yAxisLabel?: string
   ): Promise<string> {
+    const yLabel = yAxisLabel || this.getLabel('amount');
     const config: ChartConfiguration = {
       type: 'bar',
       data: {
@@ -185,7 +210,7 @@ export class ChartGenerator {
             beginAtZero: true,
             title: {
               display: true,
-              text: yAxisLabel,
+              text: yLabel,
               font: { size: 14 }
             }
           }
@@ -203,8 +228,9 @@ export class ChartGenerator {
     labels: string[], 
     datasets: Array<{ label: string; data: number[]; borderColor?: string }>,
     title: string,
-    yAxisLabel: string = 'Amount'
+    yAxisLabel?: string
   ): Promise<string> {
+    const yLabel = yAxisLabel || this.getLabel('cost');
     const config: ChartConfiguration = {
       type: 'line',
       data: {
@@ -246,7 +272,7 @@ export class ChartGenerator {
             beginAtZero: false,
             title: {
               display: true,
-              text: yAxisLabel,
+              text: yLabel,
               font: { size: 14 }
             },
             ticks: {
@@ -258,7 +284,7 @@ export class ChartGenerator {
           x: {
             title: {
               display: true,
-              text: 'Time Period',
+              text: this.getLabel('timePeriod'),
               font: { size: 14 }
             }
           }
