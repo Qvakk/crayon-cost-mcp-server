@@ -9,7 +9,7 @@ Contact your Crayon account team to obtain:
 - Client ID
 - Client Secret
 - Username
-- Password
+- Password 
 
 ### 2. Setup Environment
 
