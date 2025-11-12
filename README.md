@@ -9,7 +9,7 @@ Contact your Crayon account team to obtain:
 - Client ID
 - Client Secret
 - Username
-- Password
+- Password 
 
 ### 2. Setup Environment
 
@@ -35,7 +35,7 @@ Copy-Item .env.example .env
 
 ### 3. Configure Credentials
 
-Edit `.env` file and add your credentials:
+Edit `.env` file and fill in your Crayon credentials:
 
 ```bash
 # Required - Get from Crayon account team
@@ -44,17 +44,12 @@ CRAYON_CLIENT_SECRET=your_client_secret_here
 CRAYON_USERNAME=your_username_here
 CRAYON_PASSWORD=your_password_here
 
-# Generate secure JWT secret
-# Linux/Mac: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-# Windows:   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+# Required - Generate secure JWT secret (64 characters)
+# Run: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 JWT_SECRET=paste_generated_64_char_hex_string_here
-
-# Optional - defaults work fine
-CRAYON_API_BASE_URL=https://api.crayon.com/api/v1
-PORT=3003
-NODE_ENV=production
-AUTH_ENABLED=false  # Set to true in production
 ```
+
+**Note:** The `.env.example` file contains all available configuration options with detailed comments. The above are the minimum required settings to get started.
 
 ### 4. Run Locally with Docker
 
@@ -71,24 +66,9 @@ curl http://localhost:3003/health
 # Expected: {"status":"ok","timestamp":"2025-11-11T..."}
 ```
 
-### 6. Deploy to Azure (Production)
-
-```bash
-# Make script executable
-chmod +x deploy-azure.sh
-
-# Deploy (script will prompt for credentials)
-./deploy-azure.sh
-
-# Takes ~5-10 minutes
-# You'll get a public HTTPS URL when done
-```
-
----
-
 ## Available MCP Tools
 
-The server provides **22 tools** for comprehensive cost analysis:
+The server provides **26 tools** for comprehensive cost analysis:
 
 ### Core Tools
 - **`get_organizations`** - List all accessible organizations
@@ -97,6 +77,7 @@ The server provides **22 tools** for comprehensive cost analysis:
 - **`get_invoices`** - Invoice details and status
 - **`get_invoice_profiles`** - Billing group profiles
 - **`get_cost_summary`** - Combined cost analysis
+- **`get_customer_tenants`** - Customer tenant information for correlation
 
 ### Azure-Specific Tools
 - **`get_azure_usage`** - Detailed Azure consumption (CSV download)
@@ -109,15 +90,28 @@ The server provides **22 tools** for comprehensive cost analysis:
 ### Subscription Management
 - **`get_subscriptions`** - All cloud subscriptions (Azure, AWS, etc.)
 - **`get_subscription_details`** - Detailed subscription info with metadata
-- **`get_subscription_tags`** - Tags for cost allocation
-- **`update_subscription_tags`** - Update subscription tags
+- **`get_subscription_tags`** - Tags for cost allocation and tracking
+- **`update_subscription_tags`** - Update subscription tags for organization
+- **`list_all_subscriptions_with_tags`** - Complete subscription and tag inventory
 
-### Advanced Analytics
-- **`get_historical_costs`** - Multi-month cost history for trends
-- **`get_cost_by_subscription`** - Cost breakdown by subscription
-- **`track_costs_by_tags`** - Cost allocation by tags (department, project, etc.)
-- **`get_cost_trends`** - Month-over-month trends and averages
-- **`detect_cost_anomalies`** - Identify unexpected cost spikes
+### Advanced Analytics & Visualization
+- **`get_historical_costs`** - Multi-month cost history for forecasting
+- **`get_cost_by_subscription`** - 📊 Cost breakdown by subscription with **pie/doughnut chart**
+- **`track_costs_by_tags`** - Cost allocation by tags (department, project, environment)
+- **`get_cost_trends`** - 📈 Month-over-month trends with **line chart visualization**
+- **`detect_cost_anomalies`** - Identify subscriptions with unexpected cost spikes
+- **`analyze_costs_by_tags`** - Breakdown costs by CostCenter, Department, Project, etc.
+- **`find_similar_subscriptions_and_invoices`** - Find related subscriptions by name pattern
+- **`get_last_month_costs_by_tags`** - Last month cost breakdown by tags
+- **`get_last_month_costs_by_invoice_profile`** - Last month costs per invoice profile
+- **`get_last_month_costs_by_organization`** - Last month total by organization
+
+### Key Features
+- ✅ All historical cost tools use **complete billing months** (start from 1st of month)
+- 📊 **Chart visualization** for trend analysis and cost distribution
+- 🔤 **Proper font rendering** with DejaVu Sans, Liberation, and Noto fonts
+- 🔍 **Correlation tools** to link billing data with Azure/AWS resources
+- 🏷️ **Tag-based analytics** for departmental cost allocation
 
 ## Support
 

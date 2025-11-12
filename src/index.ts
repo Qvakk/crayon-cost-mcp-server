@@ -9,6 +9,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import express, { Request, Response, NextFunction } from 'express';
 import { randomUUID } from 'node:crypto';
+import * as fs from 'fs';
 import dotenv from 'dotenv';
 import rateLimit from 'express-rate-limit';
 import { CrayonApiClient } from './crayon-client.js';
@@ -16,6 +17,7 @@ import { logger, logAudit, logToolExecution, logSecurityEvent } from './middlewa
 import { authenticateRequest, authorizeOrganization, generateTestToken } from './middleware/auth.js';
 import { validateToolInput } from './middleware/validation.js';
 import { sanitizeErrorMessage, createCircuitBreakerWrapper, expensiveOperations, rateLimiterConfig } from './middleware/security.js';
+import { chartGenerator } from './utils/chart-generator.js';
 
 dotenv.config();
 
@@ -595,19 +597,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
   const userId = (request as any).user?.id || 'unknown';
-  const organizationId = (args as any)?.organizationId || null;
+  let organizationId = (args as any)?.organizationId || null;
   const startTime = Date.now();
 
   try {
     // OWASP Security: A02:2021 - Prompt Injection & A09:2021 - Weak Validation
     // Validate tool input against schema
-    const validationError = validateToolInput(name, args);
-    if (validationError) {
+    let validatedArgs: any = args;
+    try {
+      console.log(`[Tool Call] ${name} with args:`, JSON.stringify(args, null, 2));
+      validatedArgs = await validateToolInput(name, args);
+      console.log(`[Validation OK] ${name}`);
+      organizationId = (validatedArgs as any)?.organizationId || organizationId;
+    } catch (validationError: any) {
+      console.log(`[Validation FAILED] ${name}:`, validationError?.message || validationError);
+      const errorMessage = validationError?.message || 'Unknown validation error occurred';
+      
       logger.warn(`Tool validation failed for ${name}`, {
         toolName: name,
         userId,
         organizationId,
-        error: validationError,
+        error: errorMessage,
       });
       logSecurityEvent({
         type: 'injection_attempt',
@@ -615,17 +625,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ip: 'unknown',
         details: {
           tool: name,
-          reason: validationError,
+          reason: errorMessage,
         },
       });
+      
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify({
-              error: 'Validation failed',
-              details: validationError,
-            }),
+            text: errorMessage || 'Validation failed with no details available',
           },
         ],
         isError: true,
@@ -641,7 +649,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     switch (name) {
       case 'get_billing_statements': {
-        const result = await crayonClient.getBillingStatements(args as any);
+        const result = await crayonClient.getBillingStatements(validatedArgs as any);
         const duration = Date.now() - startTime;
         logToolExecution({
           tool: name,
@@ -661,7 +669,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_grouped_billing_statements': {
-        const result = await crayonClient.getGroupedBillingStatements(args as any);
+        const result = await crayonClient.getGroupedBillingStatements(validatedArgs as any);
         const duration = Date.now() - startTime;
         logToolExecution({
           tool: name,
@@ -681,7 +689,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_azure_usage': {
-        const result = await crayonClient.getAzureUsage(args as any);
+        const result = await crayonClient.getAzureUsage(validatedArgs as any);
         return {
           content: [
             {
@@ -693,7 +701,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_invoices': {
-        const { organizationId, page, pageSize } = args as any;
+        const { organizationId, page, pageSize } = validatedArgs as any;
         const result = await crayonClient.getInvoices(organizationId, page, pageSize);
         return {
           content: [
@@ -706,7 +714,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_invoice_profiles': {
-        const { organizationId } = args as any;
+        const { organizationId } = validatedArgs as any;
         const result = await crayonClient.getInvoiceProfiles(organizationId);
         return {
           content: [
@@ -739,7 +747,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_historical_costs': {
-        const { organizationId, monthsBack = 6, invoiceProfileId } = args as any;
+        const { organizationId, monthsBack = 6, invoiceProfileId } = validatedArgs as any;
         const result = await crayonClient.getHistoricalBilling(organizationId, monthsBack, invoiceProfileId);
         
         return {
@@ -758,7 +766,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_customer_tenants': {
-        const { organizationId } = args as any;
+        const { organizationId } = validatedArgs as any;
         const result = await crayonClient.getCustomerTenants(organizationId);
         return {
           content: [
@@ -771,7 +779,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_azure_subscriptions': {
-        const { customerTenantId } = args as any;
+        const { customerTenantId } = validatedArgs as any;
         const result = await crayonClient.getAzureSubscriptions(customerTenantId);
         return {
           content: [
@@ -784,7 +792,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_subscriptions': {
-        const { organizationId, page, pageSize } = args as any;
+        const { organizationId, page, pageSize } = validatedArgs as any;
         const result = await crayonClient.getSubscriptions(organizationId, page, pageSize);
         return {
           content: [
@@ -797,7 +805,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_cost_by_subscription': {
-        const { organizationId, invoiceProfileId, monthsBack = 3 } = args as any;
+        const { organizationId, invoiceProfileId, monthsBack = 3 } = validatedArgs as any;
         
         // Get historical billing and subscriptions in parallel
         const [billingData, subscriptions] = await Promise.all([
@@ -828,7 +836,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_subscription_details': {
-        const { subscriptionId } = args as any;
+        const { subscriptionId } = validatedArgs as any;
         const result = await crayonClient.getSubscriptionById(subscriptionId);
         return {
           content: [
@@ -841,7 +849,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_subscription_tags': {
-        const { subscriptionId } = args as any;
+        const { subscriptionId } = validatedArgs as any;
         const result = await crayonClient.getSubscriptionTags(subscriptionId);
         return {
           content: [
@@ -854,7 +862,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'update_subscription_tags': {
-        const { subscriptionId, tags } = args as any;
+        const { subscriptionId, tags } = validatedArgs as any;
         const result = await crayonClient.updateSubscriptionTags(subscriptionId, tags);
         return {
           content: [
@@ -871,7 +879,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_azure_plan_details': {
-        const { azurePlanId } = args as any;
+        const { azurePlanId } = validatedArgs as any;
         const result = await crayonClient.getAzurePlan(azurePlanId);
         return {
           content: [
@@ -884,7 +892,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_azure_plan_subscriptions': {
-        const { azurePlanId } = args as any;
+        const { azurePlanId } = validatedArgs as any;
         const result = await crayonClient.getAzurePlanSubscriptions(azurePlanId);
         return {
           content: [
@@ -897,7 +905,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'track_costs_by_tags': {
-        const { organizationId, monthsBack = 3 } = args as any;
+        const { organizationId, monthsBack = 3 } = validatedArgs as any;
         const result = await crayonClient.getCostByTags(organizationId, monthsBack);
         
         return {
@@ -916,7 +924,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_azure_costs_by_date_range': {
-        const { organizationId, from, to } = args as any;
+        const { organizationId, from, to } = validatedArgs as any;
         const result = await crayonClient.getAzureCostsByDateRange(organizationId, from, to);
         
         return {
@@ -936,7 +944,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_azure_costs_by_subscription': {
-        const { azurePlanId, subscriptionId, from, to } = args as any;
+        const { azurePlanId, subscriptionId, from, to } = validatedArgs as any;
         const result = await crayonClient.getAzureCostsBySubscription(azurePlanId, subscriptionId, from, to);
         
         return {
@@ -957,9 +965,59 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_cost_trends': {
-        const { organizationId, monthsBack = 6 } = args as any;
+        const { organizationId, monthsBack = 6 } = validatedArgs as any;
         const result = await crayonClient.getCostTrends(organizationId, monthsBack);
         
+        // Generate line chart if we have data
+        if (result.trends && result.trends.length > 0) {
+          const labels = result.trends.map((t: any) => t.month);
+          const costData = result.trends.map((t: any) => t.cost);
+          
+          console.log(`[Chart] Generating line chart for ${labels.length} months`);
+          console.log(`[Chart] Cost range: ${Math.min(...costData)} - ${Math.max(...costData)}`);
+          
+          const chartDataUrl = await chartGenerator.generateLineChart(
+            labels,
+            [{ label: 'Monthly Cost', data: costData }],
+            `Cost Trends (Last ${monthsBack} Months)`,
+            'Cost (NOK)'
+          );
+          
+          console.log(`[Chart] Line chart generated, length: ${chartDataUrl.length}`);
+          
+          // Format summary text
+          const summary = result.summary;
+          const summaryText = `# Cost Trends Analysis (Last ${monthsBack} Months)
+
+**Average Monthly Cost:** ${summary.averageMonthlyCost ? summary.averageMonthlyCost.toFixed(2) : 'N/A'} NOK
+**Highest Month:** ${summary.highestMonth ? `${summary.highestMonth.month} (${summary.highestMonth.cost.toFixed(2)} NOK)` : 'N/A'}
+**Lowest Month:** ${summary.lowestMonth ? `${summary.lowestMonth.month} (${summary.lowestMonth.cost.toFixed(2)} NOK)` : 'N/A'}
+
+**Month-over-Month Changes:**
+${result.trends.map((t: any) => {
+  const changeText = t.change !== null 
+    ? `${t.change >= 0 ? '+' : ''}${t.change.toFixed(2)} NOK (${t.changePercent >= 0 ? '+' : ''}${t.changePercent}%)`
+    : 'N/A';
+  return `- ${t.month}: ${t.cost.toFixed(2)} NOK (${changeText})`;
+}).join('\n')}
+`;
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: summaryText,
+              },
+              {
+                type: 'image',
+                data: chartDataUrl.split(',')[1],
+                mimeType: 'image/png',
+              },
+            ],
+          };
+        }
+        
+        // Fallback: return JSON if no data for chart
         return {
           content: [
             {
@@ -976,7 +1034,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'detect_cost_anomalies': {
-        const { organizationId, monthsBack = 3, changeThresholdPercent = 25 } = args as any;
+        const { organizationId, monthsBack = 3, changeThresholdPercent = 25 } = validatedArgs as any;
         const result = await crayonClient.detectCostAnomalies(organizationId, monthsBack, changeThresholdPercent);
         
         return {
@@ -996,7 +1054,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'analyze_costs_by_tags': {
-        const { organizationId, monthsBack = 3 } = args as any;
+        const { organizationId, monthsBack = 3 } = validatedArgs as any;
         const result = await crayonClient.analyzeCostsByTags(organizationId, monthsBack);
         
         return {
@@ -1015,7 +1073,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'find_similar_subscriptions_and_invoices': {
-        const { organizationId, namePattern } = args as any;
+        const { organizationId, namePattern } = validatedArgs as any;
         const result = await crayonClient.findSimilarSubscriptionsAndInvoices(organizationId, namePattern);
         
         return {
@@ -1034,7 +1092,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'list_all_subscriptions_with_tags': {
-        const { organizationId } = args as any;
+        const { organizationId } = validatedArgs as any;
         const result = await crayonClient.listAllSubscriptionsWithTags(organizationId);
         
         return {
@@ -1052,7 +1110,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_last_month_costs_by_organization': {
-        const { organizationId } = args as any;
+        const { organizationId } = validatedArgs as any;
         const result = await crayonClient.getLastMonthCostsByOrganization(organizationId);
         
         return {
@@ -1070,7 +1128,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_last_month_costs_by_invoice_profile': {
-        const { organizationId } = args as any;
+        const { organizationId } = validatedArgs as any;
         const result = await crayonClient.getLastMonthCostsByInvoiceProfile(organizationId);
         
         return {
@@ -1088,7 +1146,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_last_month_costs_by_tags': {
-        const { organizationId } = args as any;
+        const { organizationId } = validatedArgs as any;
         const result = await crayonClient.getLastMonthCostsByTags(organizationId);
         
         return {
@@ -1105,6 +1163,69 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case 'visualize_costs_pie_chart': {
+        const { organizationId, monthsBack = 3, topN = 10, chartStyle = 'pie' } = validatedArgs as any;
+        
+        console.log(`[Chart] Fetching billing data for org ${organizationId}, ${monthsBack} months`);
+        // Get billing data for the period
+        const billingDataResponse = await crayonClient.getHistoricalBilling(organizationId, monthsBack);
+        const billingData = Array.isArray(billingDataResponse) ? billingDataResponse : (billingDataResponse?.data || []);
+        console.log(`[Chart] Got ${billingData.length} billing records`);
+        
+        // Group by subscription and sum costs
+        const subscriptionCosts = billingData.reduce((acc: any, item: any) => {
+          const subName = item.subscriptionName || item.name || 'Unknown';
+          const cost = parseFloat(item.totalSalesPrice || item.totalCost || item.cost || 0);
+          acc[subName] = (acc[subName] || 0) + cost;
+          return acc;
+        }, {});
+        
+        console.log(`[Chart] Grouped into ${Object.keys(subscriptionCosts).length} subscriptions`);
+        
+        // Sort and take top N
+        const sortedData = Object.entries(subscriptionCosts)
+          .sort((a: any, b: any) => b[1] - a[1])
+          .slice(0, topN);
+        
+        const labels = sortedData.map(([name]) => name);
+        const values = sortedData.map(([, cost]) => cost as number);
+        const total = values.reduce((sum, val) => sum + val, 0);
+        
+        console.log(`[Chart] Top ${labels.length} subscriptions, total: $${total}`);
+        console.log(`[Chart] Generating ${chartStyle} chart...`);
+        
+        // Generate chart
+        const chartDataUrl = chartStyle === 'doughnut'
+          ? await chartGenerator.generateDoughnutChart(
+              labels,
+              values,
+              `Cost Distribution by Subscription (Last ${monthsBack} Months)`,
+              'USD'
+            )
+          : await chartGenerator.generatePieChart(
+              labels,
+              values,
+              `Cost Distribution by Subscription (Last ${monthsBack} Months)`,
+              'USD'
+            );
+        
+        console.log(`[Chart] Chart generated, length: ${chartDataUrl.length}`);
+        
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `# Cost Distribution (Last ${monthsBack} Months)\n\n**Total Cost:** $${total.toFixed(2)}\n**Top ${labels.length} Subscriptions:**\n${sortedData.map(([name, cost], idx) => `${idx + 1}. ${name}: $${(cost as number).toFixed(2)} (${((cost as number / total) * 100).toFixed(1)}%)`).join('\n')}\n\n`,
+            },
+            {
+              type: 'image',
+              data: chartDataUrl.split(',')[1],
+              mimeType: 'image/png',
+            },
+          ],
+        };
+      }
+
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -1114,6 +1235,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     const axiosError = error instanceof Error && (error as any).response;
     const statusCode = axiosError ? (error as any).response.status : 'unknown';
+    
+    console.log(`[ERROR] Tool execution failed: ${name}`, errorMessage);
+    console.log(`[ERROR] Stack:`, error instanceof Error ? error.stack : 'No stack trace');
     
     // Log full error for audit trail
     logger.error(`Tool execution error [${name}]`, {
@@ -1233,13 +1357,16 @@ async function startServer() {
       
       try {
         const sessionId = req.headers['mcp-session-id'] as string | undefined;
+        console.log(`[HTTP Request] Session ID: ${sessionId}, Method: ${req.method}, Body method: ${req.body?.method}`);
         let transport: StreamableHTTPServerTransport;
 
         if (sessionId && transports[sessionId]) {
           // Reuse existing transport for this session
+          console.log(`[Session] Found transport for session ${sessionId}`);
           transport = transports[sessionId];
         } else if (!sessionId && req.method === 'POST' && req.body?.method === 'initialize') {
           // Create new transport for initialization request
+          console.log(`[Session] Creating new transport for initialization`);
           transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
             onsessioninitialized: (newSessionId) => {
@@ -1336,3 +1463,4 @@ startServer().catch((error) => {
   console.error('Failed to start server:', error);
   process.exit(1);
 });
+
