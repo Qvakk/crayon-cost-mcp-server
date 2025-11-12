@@ -236,7 +236,7 @@ export class ChartGenerator {
             callbacks: {
               label: (context) => {
                 const value = context.parsed.y;
-                return `${context.dataset.label}: ${value?.toLocaleString() ?? 'N/A'}`;
+                return `${context.dataset.label}: ${value.toLocaleString()}`;
               }
             }
           }
@@ -308,11 +308,9 @@ export class ChartGenerator {
               label: (context) => {
                 const point = context.parsed;
                 const label = pointLabels ? pointLabels[context.dataIndex] : '';
-                const xVal = point.x?.toFixed(2) ?? '0';
-                const yVal = point.y?.toFixed(2) ?? '0';
                 return label 
-                  ? `${label}: (${xVal}, ${yVal})`
-                  : `(${xVal}, ${yVal})`;
+                  ? `${label}: (${point.x.toFixed(2)}, ${point.y.toFixed(2)})`
+                  : `(${point.x.toFixed(2)}, ${point.y.toFixed(2)})`;
               }
             }
           }

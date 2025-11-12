@@ -32,12 +32,6 @@ Thumbs.db
 *.swo
 *~
 
-# Test files
-test-init.json
-
-# Docker
-.dockerignore
-
 # Temporary files
 *.tmp
 *.temp
