@@ -35,7 +35,7 @@ Copy-Item .env.example .env
 
 ### 3. Configure Credentials
 
-Edit `.env` file and fill in your Crayon credentials:
+Edit `.env` file and fill in your Crayon credentials and authentication token:
 
 ```bash
 # Required - Get from Crayon account team
@@ -44,9 +44,9 @@ CRAYON_CLIENT_SECRET=your_client_secret_here
 CRAYON_USERNAME=your_username_here
 CRAYON_PASSWORD=your_password_here
 
-# Required - Generate secure JWT secret (64 characters)
+# Required - Generate secure Bearer token (32+ characters)
 # Run: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-JWT_SECRET=paste_generated_64_char_hex_string_here
+AUTH_TOKEN=paste_generated_secure_token_here
 ```
 
 **Note:** The `.env.example` file contains all available configuration options with detailed comments. The above are the minimum required settings to get started.
