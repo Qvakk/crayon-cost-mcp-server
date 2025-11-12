@@ -1,6 +1,6 @@
 # Crayon Cost MCP Server
 
-Enterprise-grade MCP server providing cost and billing analytics from Crayon CloudIQ APIs.
+MCP server providing cost and billing analytics from Crayon CloudIQ APIs.
 
 ## Quick Start (5 Minutes)
 
@@ -55,8 +55,6 @@ PORT=3003
 NODE_ENV=production
 AUTH_ENABLED=false  # Set to true in production
 ```
-
-**⚠️ IMPORTANT:** Never commit the `.env` file to git! It's already in `.gitignore`.
 
 ### 4. Run Locally with Docker
 
