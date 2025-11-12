@@ -1,5 +1,4 @@
 import { Request, Response, NextFunction } from 'express';
-import jwt, { SignOptions } from 'jsonwebtoken';
 import { logger } from './logger.js';
 
 // Extend Express Request to include user
@@ -17,7 +16,7 @@ declare global {
 }
 
 /**
- * Authentication middleware - validates JWT token
+ * Authentication middleware - validates Bearer token
  */
 export function authenticateRequest(req: Request, res: Response, next: NextFunction): void {
   // Skip auth if disabled (development only)
@@ -31,7 +30,27 @@ export function authenticateRequest(req: Request, res: Response, next: NextFunct
     return next();
   }
 
-  const token = req.headers.authorization?.split(' ')[1];
+  const authHeader = req.headers.authorization;
+  
+  // For MCP initialize requests without auth, create a session without user context
+  // This allows VS Code's MCP client discovery to work
+  if (!authHeader && req.method === 'POST' && req.body?.method === 'initialize') {
+    req.user = {
+      id: 'anonymous',
+      email: 'anonymous@crayon-cost-mcp.local',
+      organizations: [4040561, 4019092], // All orgs for now
+      roles: ['viewer'],
+    };
+    return next();
+  }
+
+  if (!authHeader) {
+    logger.warn('Unauthorized: Missing authorization header');
+    res.status(401).json({ error: 'Unauthorized: Missing authorization header' });
+    return;
+  }
+
+  const token = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
 
   if (!token) {
     logger.warn('Unauthorized: Missing authentication token');
@@ -39,28 +58,30 @@ export function authenticateRequest(req: Request, res: Response, next: NextFunct
     return;
   }
 
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET!) as any;
-    
-    // Validate token structure
-    if (!decoded.id || !decoded.email || !decoded.organizations) {
-      logger.warn('Invalid token structure', { decoded });
-      res.status(401).json({ error: 'Invalid token structure' });
-      return;
-    }
-
-    req.user = {
-      id: decoded.id,
-      email: decoded.email,
-      organizations: decoded.organizations,
-      roles: decoded.roles || ['viewer'],
-    };
-
-    next();
-  } catch (error) {
-    logger.warn('Token verification failed', { error: error instanceof Error ? error.message : 'Unknown' });
-    res.status(401).json({ error: 'Invalid or expired token' });
+  // Simple token validation against AUTH_TOKEN
+  const validToken = process.env.AUTH_TOKEN;
+  
+  if (!validToken) {
+    logger.error('Server misconfiguration: AUTH_TOKEN not set');
+    res.status(500).json({ error: 'Server authentication not configured' });
+    return;
   }
+
+  if (token !== validToken) {
+    logger.warn('Invalid token provided');
+    res.status(401).json({ error: 'Invalid authentication token' });
+    return;
+  }
+
+  // Token is valid - set default user with admin access to all orgs
+  req.user = {
+    id: 'api-user',
+    email: 'api@crayon-cost-mcp.local',
+    organizations: [4040561, 4019092], // All orgs
+    roles: ['admin'],
+  };
+
+  next();
 }
 
 /**
@@ -106,23 +127,4 @@ export function authorizeOrganization(requiredRole: string = 'viewer') {
 
     next();
   };
-}
-
-/**
- * Generate JWT token for testing/development
- */
-export function generateTestToken(userId: string, email: string, organizations: number[], roles: string[] = ['viewer']): string {
-  const payload = {
-    id: userId,
-    email,
-    organizations,
-    roles,
-  };
-
-  const secret = process.env.JWT_SECRET || 'default-secret-change-in-production';
-  const signOptions: SignOptions = {
-    expiresIn: '24h',
-    issuer: 'crayon-cost-mcp',
-  };
-  return jwt.sign(payload, secret, signOptions);
 }

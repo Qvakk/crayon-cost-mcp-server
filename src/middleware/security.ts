@@ -99,19 +99,7 @@ export function sanitizeErrorMessage(error: any, toolName: string): string {
 }
 
 /**
- * Create a rate limiter configuration
- */
-export const rateLimiterConfig = {
-  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '900000'), // 15 minutes
-  max: {
-    global: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '1000'),
-    perUser: parseInt(process.env.RATE_LIMIT_USER_MAX || '100'),
-    expensive: parseInt(process.env.RATE_LIMIT_EXPENSIVE_MAX || '5'),
-  },
-};
-
-/**
- * List of expensive operations that need stricter rate limiting
+ * List of expensive operations for monitoring
  */
 export const expensiveOperations = [
   'get_azure_usage',          // Downloads CSV files

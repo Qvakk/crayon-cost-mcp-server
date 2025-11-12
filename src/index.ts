@@ -11,29 +11,26 @@ import express, { Request, Response, NextFunction } from 'express';
 import { randomUUID } from 'node:crypto';
 import * as fs from 'fs';
 import dotenv from 'dotenv';
-import rateLimit from 'express-rate-limit';
 import { CrayonApiClient } from './crayon-client.js';
-import { logger, logAudit, logToolExecution, logSecurityEvent } from './middleware/logger.js';
-import { authenticateRequest, authorizeOrganization, generateTestToken } from './middleware/auth.js';
+import { logger, logAudit, logToolExecution } from './middleware/logger.js';
+import { authenticateRequest, authorizeOrganization } from './middleware/auth.js';
 import { validateToolInput } from './middleware/validation.js';
-import { sanitizeErrorMessage, createCircuitBreakerWrapper, expensiveOperations, rateLimiterConfig } from './middleware/security.js';
+import { sanitizeErrorMessage, createCircuitBreakerWrapper, expensiveOperations } from './middleware/security.js';
 import { chartGenerator } from './utils/chart-generator.js';
+import { formatMonthYear, getCurrentLocale } from './utils/localization.js';
 
 dotenv.config();
 
 // Validate required security configuration
-if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
-  console.error('ERROR: JWT_SECRET not set or too short (minimum 32 characters)');
-  console.error('Please set JWT_SECRET in .env file');
-  if (process.env.AUTH_ENABLED !== 'false') {
-    process.exit(1);
-  }
+if (process.env.AUTH_ENABLED !== 'false' && !process.env.AUTH_TOKEN) {
+  console.error('ERROR: AUTH_TOKEN not set');
+  console.error('Please set AUTH_TOKEN in .env file');
+  process.exit(1);
 }
 
 // Configuration validation and secure defaults
 const PORT = parseInt(process.env.PORT || '3003', 10);
 const HOST = process.env.HOST || '0.0.0.0';
-const NODE_ENV = process.env.NODE_ENV || 'development';
 const AUTH_ENABLED = process.env.AUTH_ENABLED !== 'false';
 
 // Validate required credentials
@@ -619,15 +616,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         organizationId,
         error: errorMessage,
       });
-      logSecurityEvent({
-        type: 'injection_attempt',
-        userId,
-        ip: 'unknown',
-        details: {
-          tool: name,
-          reason: errorMessage,
-        },
-      });
       
       return {
         content: [
@@ -970,14 +958,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         
         // Generate line chart if we have data
         if (result.trends && result.trends.length > 0) {
-          const labels = result.trends.map((t: any) => t.month);
+          const locale = getCurrentLocale();
+          const monthLabels = result.trends.map((t: any) => t.month);
+          const formattedLabels = monthLabels.map((m: string) => formatMonthYear(m, locale));
           const costData = result.trends.map((t: any) => t.cost);
           
-          console.log(`[Chart] Generating line chart for ${labels.length} months`);
+          console.log(`[Chart] Generating line chart for ${formattedLabels.length} months`);
           console.log(`[Chart] Cost range: ${Math.min(...costData)} - ${Math.max(...costData)}`);
           
           const chartDataUrl = await chartGenerator.generateLineChart(
-            labels,
+            formattedLabels,
             [{ label: 'Monthly Cost', data: costData }],
             `Cost Trends (Last ${monthsBack} Months)`,
             'Cost (NOK)'
@@ -985,20 +975,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           
           console.log(`[Chart] Line chart generated, length: ${chartDataUrl.length}`);
           
-          // Format summary text
+          // Format summary text with localized month names
           const summary = result.summary;
           const summaryText = `# Cost Trends Analysis (Last ${monthsBack} Months)
 
 **Average Monthly Cost:** ${summary.averageMonthlyCost ? summary.averageMonthlyCost.toFixed(2) : 'N/A'} NOK
-**Highest Month:** ${summary.highestMonth ? `${summary.highestMonth.month} (${summary.highestMonth.cost.toFixed(2)} NOK)` : 'N/A'}
-**Lowest Month:** ${summary.lowestMonth ? `${summary.lowestMonth.month} (${summary.lowestMonth.cost.toFixed(2)} NOK)` : 'N/A'}
+**Highest Month:** ${summary.highestMonth ? `${formatMonthYear(summary.highestMonth.month, locale)} (${summary.highestMonth.cost.toFixed(2)} NOK)` : 'N/A'}
+**Lowest Month:** ${summary.lowestMonth ? `${formatMonthYear(summary.lowestMonth.month, locale)} (${summary.lowestMonth.cost.toFixed(2)} NOK)` : 'N/A'}
 
 **Month-over-Month Changes:**
 ${result.trends.map((t: any) => {
   const changeText = t.change !== null 
     ? `${t.change >= 0 ? '+' : ''}${t.change.toFixed(2)} NOK (${t.changePercent >= 0 ? '+' : ''}${t.changePercent}%)`
     : 'N/A';
-  return `- ${t.month}: ${t.cost.toFixed(2)} NOK (${changeText})`;
+  return `- ${formatMonthYear(t.month, locale)}: ${t.cost.toFixed(2)} NOK (${changeText})`;
 }).join('\n')}
 `;
 
@@ -1313,29 +1303,6 @@ async function startServer() {
       next();
     });
 
-    // OWASP Security: A08:2021 - Insecure Rate Limiting
-    // Global rate limiter
-    const globalLimiter = rateLimit({
-      windowMs: rateLimiterConfig.windowMs,
-      max: rateLimiterConfig.max.global,
-      message: 'Too many requests from this IP, please try again later',
-      standardHeaders: true,
-      legacyHeaders: false,
-    });
-
-    // Per-user rate limiter
-    const userLimiter = rateLimit({
-      keyGenerator: (req) => req.user?.id || req.ip || 'unknown',
-      windowMs: rateLimiterConfig.windowMs,
-      max: rateLimiterConfig.max.perUser,
-      message: 'Too many requests from this user',
-      skip: (req) => !AUTH_ENABLED,
-    });
-
-    // Apply rate limiters globally
-    app.use(globalLimiter);
-    app.use(userLimiter);
-
     // Health check endpoint (no auth required)
     app.get('/health', (_req: Request, res: Response) => {
       res.json({ 
@@ -1423,32 +1390,25 @@ async function startServer() {
       console.log(`MCP endpoint: http://${HOST}:${PORT}/mcp`);
       console.log(`${'='.repeat(80)}\n`);
       
-      // Generate and display authentication token for production use
+      // Display authentication instructions for production use
       if (AUTH_ENABLED) {
-        try {
-          const authToken = generateTestToken('admin', 'admin@crayon-cost-mcp.local', [], ['admin']);
-          console.log('AUTHENTICATION TOKEN (valid for 24 hours):');
-          console.log(`${'─'.repeat(80)}`);
-          console.log(`Token: ${authToken}`);
-          console.log(`${'─'.repeat(80)}`);
-          console.log('\nUsage in MCP requests:');
-          console.log(`curl -X POST http://localhost:${PORT}/mcp \\`);
-          console.log(`  -H "Authorization: Bearer ${authToken.substring(0, 20)}..." \\`);
-          console.log(`  -H "Content-Type: application/json" \\`);
-          console.log(`  -d '{...}'`);
-          console.log('\n');
-          
-          // Log token generation for audit trail
-          logger.info('MCP Server authentication token generated at startup', {
-            userId: 'admin',
-            tokenPrefix: authToken.substring(0, 20),
-            expiresIn: '24h',
-            timestamp: new Date().toISOString(),
-          });
-        } catch (err) {
-          logger.error('Failed to generate authentication token', { error: err });
-          console.error('WARNING: Could not generate authentication token');
-        }
+        const authToken = process.env.AUTH_TOKEN || 'NOT_SET';
+        console.log('AUTHENTICATION TOKEN:');
+        console.log(`${'─'.repeat(80)}`);
+        console.log(`Token: ${authToken}`);
+        console.log(`${'─'.repeat(80)}`);
+        console.log('\nUsage in MCP requests:');
+        console.log(`curl -X POST http://localhost:${PORT}/mcp \\`);
+        console.log(`  -H "Authorization: Bearer ${authToken}" \\`);
+        console.log(`  -H "Content-Type: application/json" \\`);
+        console.log(`  -d '{...}'`);
+        console.log('\n');
+        
+        // Log token display for audit trail
+        logger.info('MCP Server started with authentication enabled', {
+          tokenSet: authToken !== 'NOT_SET',
+          timestamp: new Date().toISOString(),
+        });
       }
       
       if (process.env.NODE_ENV !== 'production') {
