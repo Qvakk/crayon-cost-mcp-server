@@ -309,6 +309,12 @@ export class CrayonApiClient {
     const endDate = new Date();
     const startDate = new Date();
     startDate.setMonth(startDate.getMonth() - monthsBack);
+    
+    // Set to first day of the month to capture complete billing periods
+    // Billing statements have StartDate/EndDate periods (e.g., 2025-08-01 to 2025-09-01)
+    // We need to start from the 1st of the month to include those billing periods
+    startDate.setDate(1);
+    startDate.setHours(0, 0, 0, 0);
 
     const filter = {
       organizationId,
@@ -529,8 +535,15 @@ export class CrayonApiClient {
     // Aggregate costs by month
     if (historicalData.Items) {
       historicalData.Items.forEach((item: any) => {
-        const month = item.Date || item.Month || 'unknown';
-        costsByMonth[month] = (costsByMonth[month] || 0) + (item.TotalSalesPrice || 0);
+        // Extract month from StartDate (format: 2025-10-01T00:00:00+00:00)
+        const startDate = item.StartDate ? new Date(item.StartDate) : null;
+        const month = startDate 
+          ? `${startDate.getFullYear()}-${String(startDate.getMonth() + 1).padStart(2, '0')}` 
+          : 'unknown';
+        
+        // Extract numeric value from TotalSalesPrice object
+        const cost = item.TotalSalesPrice?.Value || 0;
+        costsByMonth[month] = (costsByMonth[month] || 0) + cost;
       });
     }
 
@@ -561,9 +574,9 @@ export class CrayonApiClient {
       trends,
       summary: {
         totalMonths: trends.length,
-        averageMonthlyCost: trends.reduce((sum: number, t: any) => sum + t.cost, 0) / trends.length,
-        highestMonth: trends.reduce((max: any, t: any) => (t.cost > max.cost ? t : max), trends[0]),
-        lowestMonth: trends.reduce((min: any, t: any) => (t.cost < min.cost ? t : min), trends[0]),
+        averageMonthlyCost: trends.length > 0 ? trends.reduce((sum: number, t: any) => sum + t.cost, 0) / trends.length : 0,
+        highestMonth: trends.length > 0 ? trends.reduce((max: any, t: any) => (t.cost > max.cost ? t : max), trends[0]) : null,
+        lowestMonth: trends.length > 0 ? trends.reduce((min: any, t: any) => (t.cost < min.cost ? t : min), trends[0]) : null,
       },
     };
   }
