@@ -170,6 +170,39 @@ export const schemas = {
   get_last_month_costs_by_tags: Joi.object({
     organizationId: positiveInteger,
   }),
+
+  // Visualization tools
+  visualize_costs_pie_chart: Joi.object({
+    organizationId: Joi.number().integer().positive().required(),
+    monthsBack: Joi.number().integer().min(1).max(24).default(3),
+    topN: Joi.number().integer().min(1).max(50).default(10),
+    chartStyle: Joi.string().valid('pie', 'doughnut').default('pie'),
+  }),
+
+  visualize_cost_trends: Joi.object({
+    organizationId: positiveInteger,
+    monthsBack: Joi.number().integer().min(1).max(24).default(6),
+    compareSubscriptions: Joi.boolean().default(false),
+  }),
+
+  visualize_cost_comparison: Joi.object({
+    organizationId: positiveInteger,
+    compareBy: Joi.string().valid('subscriptions', 'months', 'tags').required(),
+    monthsBack: Joi.number().integer().min(1).max(24).default(3),
+    topN: Joi.number().integer().min(1).max(50).default(10),
+  }),
+
+  visualize_cost_by_tags: Joi.object({
+    organizationId: positiveInteger,
+    monthsBack: Joi.number().integer().min(1).max(24).default(3),
+    stacked: Joi.boolean().default(false),
+  }),
+
+  visualize_anomalies: Joi.object({
+    organizationId: positiveInteger,
+    monthsBack: Joi.number().integer().min(1).max(24).default(3),
+    threshold: Joi.number().min(1).max(100).default(25),
+  }),
 };
 
 /**
@@ -183,19 +216,15 @@ export async function validateToolInput(toolName: string, args: any): Promise<an
   }
 
   try {
-    const { value, error } = await schema.validateAsync(args, {
+    // Joi.validateAsync() returns the validated value directly and throws on validation error
+    const validated = await schema.validateAsync(args, {
       abortEarly: false,
       convert: true,
-      stripUnknown: true,
+      stripUnknown: false,
     });
-
-    if (error) {
-      const messages = error.details.map((d) => `${d.path.join('.')}: ${d.message}`).join(', ');
-      throw new Error(`Validation error: ${messages}`);
-    }
-
-    return value;
+    return validated;
   } catch (e) {
-    throw new Error(`Invalid input: ${e instanceof Error ? e.message : 'Unknown validation error'}`);
+    const errorMsg = e instanceof Error ? e.message : 'Unknown validation error';
+    throw new Error(`Invalid input: ${errorMsg}`);
   }
 }
