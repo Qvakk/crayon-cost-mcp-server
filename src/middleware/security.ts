@@ -1,11 +1,12 @@
 import CircuitBreaker from 'opossum';
-import { AxiosInstance } from 'axios';
 import { logger } from './logger.js';
 
 /**
  * Wraps API calls with circuit breaker and timeout
  */
-export function createCircuitBreakerWrapper(apiClient: AxiosInstance) {
+export function createCircuitBreakerWrapper(
+  onCircuitOpen?: () => void
+) {
   const breaker = new CircuitBreaker(
     async (fn: () => Promise<any>) => fn(),
     {
@@ -22,18 +23,19 @@ export function createCircuitBreakerWrapper(apiClient: AxiosInstance) {
   // Log circuit breaker state changes
   breaker.on('open', () => {
     logger.error('Circuit breaker OPENED - Crayon API appears to be down');
+    onCircuitOpen?.();
   });
 
   breaker.on('halfOpen', () => {
-    logger.warn('Circuit breaker HALF_OPEN - Testing Crayon API recovery');
+    // Only log at error level per requirements
   });
 
   breaker.on('close', () => {
-    logger.info('Circuit breaker CLOSED - Crayon API recovered');
+    // Only log at error level per requirements
   });
 
-  breaker.on('fallback', (result: any) => {
-    logger.warn('Circuit breaker FALLBACK - Using cached/default response');
+  breaker.on('fallback', (_result: any) => {
+    // Only log at error level per requirements
   });
 
   return {
@@ -49,8 +51,7 @@ export function createCircuitBreakerWrapper(apiClient: AxiosInstance) {
           circuitBreakerState: breaker.opened ? 'open' : 'closed',
         });
 
-        if (fallback) {
-          logger.info('Using fallback response');
+        if (fallback !== undefined) {
           return fallback;
         }
 
@@ -62,11 +63,13 @@ export function createCircuitBreakerWrapper(apiClient: AxiosInstance) {
      * Get circuit breaker status
      */
     getStatus() {
+      const stats = (breaker as any).stats || {};
       return {
-        state: breaker.opened ? 'open' : 'closed',
-        successCount: (breaker as any).stats.fires,
-        failureCount: (breaker as any).stats.rejects,
-        fallbackCount: (breaker as any).stats.fallbacks,
+        state: breaker.opened ? 'open' : breaker.halfOpen ? 'half-open' : 'closed',
+        successCount: stats.successes || 0,
+        failureCount: stats.failures || 0,
+        timeoutCount: stats.timeouts || 0,
+        fallbackCount: stats.fallbacks || 0,
       };
     },
   };

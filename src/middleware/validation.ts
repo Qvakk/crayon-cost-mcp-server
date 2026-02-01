@@ -170,6 +170,21 @@ export const schemas = {
   get_last_month_costs_by_tags: Joi.object({
     organizationId: positiveInteger,
   }),
+
+  get_last_month_costs_by_organization: Joi.object({
+    organizationId: positiveInteger,
+  }),
+
+  get_last_month_costs_by_invoice_profile: Joi.object({
+    organizationId: positiveInteger,
+  }),
+
+  visualize_costs_pie_chart: Joi.object({
+    organizationId: positiveInteger,
+    monthsBack: Joi.number().integer().min(1).max(24).default(3),
+    topN: Joi.number().integer().min(1).max(50).default(10),
+    chartStyle: Joi.string().valid('pie', 'doughnut').default('pie'),
+  }),
 };
 
 /**

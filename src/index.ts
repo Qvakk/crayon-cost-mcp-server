@@ -8,56 +8,99 @@ import {
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import express, { Request, Response, NextFunction } from 'express';
+import rateLimit from 'express-rate-limit';
+import helmet from 'helmet';
+import compression from 'compression';
 import { randomUUID } from 'node:crypto';
-import * as fs from 'fs';
 import dotenv from 'dotenv';
 import { CrayonApiClient } from './crayon-client.js';
-import { logger, logAudit, logToolExecution } from './middleware/logger.js';
-import { authenticateRequest, authorizeOrganization } from './middleware/auth.js';
+import { logger, logToolExecution } from './middleware/logger.js';
+import { authenticateRequest } from './middleware/auth.js';
 import { validateToolInput } from './middleware/validation.js';
-import { sanitizeErrorMessage, createCircuitBreakerWrapper, expensiveOperations } from './middleware/security.js';
+import { sanitizeErrorMessage, createCircuitBreakerWrapper } from './middleware/security.js';
 import { chartGenerator } from './utils/chart-generator.js';
 import { formatMonthYear, getCurrentLocale } from './utils/localization.js';
+import { loadConfig, createMetrics, SimpleCache, AppConfig, AppMetrics } from './utils/config.js';
 
 dotenv.config();
 
-// Validate required security configuration
-if (process.env.AUTH_ENABLED !== 'false' && !process.env.AUTH_TOKEN) {
-  console.error('ERROR: AUTH_TOKEN not set');
-  console.error('Please set AUTH_TOKEN in .env file');
+// Load and validate configuration
+let config: AppConfig;
+try {
+  config = loadConfig();
+} catch (error) {
+  console.error(error instanceof Error ? error.message : 'Configuration error');
   process.exit(1);
 }
 
-// Configuration validation and secure defaults
-const PORT = parseInt(process.env.PORT || '3003', 10);
-const HOST = process.env.HOST || '0.0.0.0';
-const AUTH_ENABLED = process.env.AUTH_ENABLED !== 'false';
+// Initialize metrics
+const metrics: AppMetrics = createMetrics();
 
-// Validate required credentials
-if (!process.env.CRAYON_CLIENT_ID || !process.env.CRAYON_CLIENT_SECRET || 
-    !process.env.CRAYON_USERNAME || !process.env.CRAYON_PASSWORD) {
-  console.error('ERROR: Missing required Crayon API credentials');
-  console.error('Please set: CRAYON_CLIENT_ID, CRAYON_CLIENT_SECRET, CRAYON_USERNAME, CRAYON_PASSWORD');
-  process.exit(1);
-}
-
-const CRAYON_CLIENT_ID = process.env.CRAYON_CLIENT_ID;
-const CRAYON_CLIENT_SECRET = process.env.CRAYON_CLIENT_SECRET;
-const CRAYON_USERNAME = process.env.CRAYON_USERNAME;
-const CRAYON_PASSWORD = process.env.CRAYON_PASSWORD;
-const CRAYON_API_BASE_URL = process.env.CRAYON_API_BASE_URL || 'https://api.crayon.com/api/v1';
+// Initialize response cache
+const responseCache = new SimpleCache<any>(config.cacheTtlMs, config.cacheMaxSize);
 
 // Initialize Crayon API client
 const crayonClient = new CrayonApiClient(
-  CRAYON_CLIENT_ID,
-  CRAYON_CLIENT_SECRET,
-  CRAYON_USERNAME,
-  CRAYON_PASSWORD,
-  CRAYON_API_BASE_URL
+  config.crayonClientId,
+  config.crayonClientSecret,
+  config.crayonUsername,
+  config.crayonPassword,
+  config.crayonApiBaseUrl
 );
 
 // Initialize circuit breaker for API calls
-const circuitBreaker = createCircuitBreakerWrapper(crayonClient as any);
+const circuitBreaker = createCircuitBreakerWrapper(() => {
+  metrics.circuitBreakerTrips++;
+});
+
+// Rate limiting configuration
+const rateLimiter = rateLimit({
+  windowMs: config.rateLimitWindowMs,
+  max: config.rateLimitMaxRequests,
+  message: { error: 'Too many requests, please try again later' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+/**
+ * Helper function to create standard tool responses
+ */
+function createToolResponse(data: any, message?: string) {
+  return {
+    content: [{
+      type: 'text' as const,
+      text: JSON.stringify(message ? { message, data } : data, null, 2),
+    }],
+  };
+}
+
+/**
+ * Helper function to execute API calls with circuit breaker protection and optional caching
+ */
+async function executeWithCircuitBreaker<T>(
+  apiCall: () => Promise<T>, 
+  cacheKey?: string,
+  fallback?: T
+): Promise<T> {
+  // Check cache first if key provided
+  if (cacheKey && config.cacheEnabled) {
+    const cached = responseCache.get(cacheKey);
+    if (cached !== undefined) {
+      metrics.cacheHits++;
+      return cached;
+    }
+    metrics.cacheMisses++;
+  }
+  
+  const result = await circuitBreaker.execute(apiCall, fallback);
+  
+  // Cache result if key provided
+  if (cacheKey && config.cacheEnabled && result !== undefined) {
+    responseCache.set(cacheKey, result);
+  }
+  
+  return result;
+}
 
 // Define MCP tools
 const tools: Tool[] = [
@@ -602,18 +645,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Validate tool input against schema
     let validatedArgs: any = args;
     try {
-      console.log(`[Tool Call] ${name} with args:`, JSON.stringify(args, null, 2));
       validatedArgs = await validateToolInput(name, args);
-      console.log(`[Validation OK] ${name}`);
       organizationId = (validatedArgs as any)?.organizationId || organizationId;
     } catch (validationError: any) {
-      console.log(`[Validation FAILED] ${name}:`, validationError?.message || validationError);
       const errorMessage = validationError?.message || 'Unknown validation error occurred';
       
-      logger.warn(`Tool validation failed for ${name}`, {
+      logger.error(`Tool validation failed for ${name}`, {
         toolName: name,
-        userId,
-        organizationId,
         error: errorMessage,
       });
       
@@ -628,16 +666,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
 
-    // Log tool execution start
-    logger.info(`Tool execution started: ${name}`, {
-      tool: name,
-      userId,
-      organizationId,
-    });
-
     switch (name) {
       case 'get_billing_statements': {
-        const result = await crayonClient.getBillingStatements(validatedArgs as any);
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getBillingStatements(validatedArgs as any)
+        );
         const duration = Date.now() - startTime;
         logToolExecution({
           tool: name,
@@ -657,7 +690,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_grouped_billing_statements': {
-        const result = await crayonClient.getGroupedBillingStatements(validatedArgs as any);
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getGroupedBillingStatements(validatedArgs as any)
+        );
         const duration = Date.now() - startTime;
         logToolExecution({
           tool: name,
@@ -666,56 +701,36 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           duration,
           status: 'success',
         });
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        return createToolResponse(result);
       }
 
       case 'get_azure_usage': {
-        const result = await crayonClient.getAzureUsage(validatedArgs as any);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getAzureUsage(validatedArgs as any)
+        );
+        return createToolResponse(result);
       }
 
       case 'get_invoices': {
         const { organizationId, page, pageSize } = validatedArgs as any;
-        const result = await crayonClient.getInvoices(organizationId, page, pageSize);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getInvoices(organizationId, page, pageSize)
+        );
+        return createToolResponse(result);
       }
 
       case 'get_invoice_profiles': {
         const { organizationId } = validatedArgs as any;
-        const result = await crayonClient.getInvoiceProfiles(organizationId);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getInvoiceProfiles(organizationId)
+        );
+        return createToolResponse(result);
       }
 
       case 'get_organizations': {
-        const result = await crayonClient.getOrganizations();
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getOrganizations()
+        );
         const duration = Date.now() - startTime;
         logToolExecution({
           tool: name,
@@ -724,84 +739,57 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           duration,
           status: 'success',
         });
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        return createToolResponse(result);
       }
 
       case 'get_historical_costs': {
         const { organizationId, monthsBack = 6, invoiceProfileId } = validatedArgs as any;
-        const result = await crayonClient.getHistoricalBilling(organizationId, monthsBack, invoiceProfileId);
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getHistoricalBilling(organizationId, monthsBack, invoiceProfileId)
+        );
         
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                organizationId,
-                monthsBack,
-                invoiceProfileId,
-                historicalData: result,
-              }, null, 2),
-            },
-          ],
-        };
+        return createToolResponse({
+          organizationId,
+          monthsBack,
+          invoiceProfileId,
+          historicalData: result,
+        });
       }
 
       case 'get_customer_tenants': {
         const { organizationId } = validatedArgs as any;
-        const result = await crayonClient.getCustomerTenants(organizationId);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getCustomerTenants(organizationId)
+        );
+        return createToolResponse(result);
       }
 
       case 'get_azure_subscriptions': {
         const { customerTenantId } = validatedArgs as any;
-        const result = await crayonClient.getAzureSubscriptions(customerTenantId);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getAzureSubscriptions(customerTenantId)
+        );
+        return createToolResponse(result);
       }
 
       case 'get_subscriptions': {
         const { organizationId, page, pageSize } = validatedArgs as any;
-        const result = await crayonClient.getSubscriptions(organizationId, page, pageSize);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getSubscriptions(organizationId, page, pageSize)
+        );
+        return createToolResponse(result);
       }
 
       case 'get_cost_by_subscription': {
         const { organizationId, invoiceProfileId, monthsBack = 3 } = validatedArgs as any;
         
-        // Get historical billing and subscriptions in parallel
+        // Get historical billing and subscriptions in parallel with circuit breaker
         const [billingData, subscriptions] = await Promise.all([
-          crayonClient.getHistoricalBilling(organizationId, monthsBack, invoiceProfileId),
-          crayonClient.getSubscriptions(organizationId),
+          executeWithCircuitBreaker(() => crayonClient.getHistoricalBilling(organizationId, monthsBack, invoiceProfileId)),
+          executeWithCircuitBreaker(() => crayonClient.getSubscriptions(organizationId)),
         ]);
 
-        const costBreakdown = {
+        return createToolResponse({
           organizationId,
           monthsBack,
           period: {
@@ -810,151 +798,81 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           },
           billingData,
           subscriptions,
-          message: 'Cost breakdown with subscription correlation',
-        };
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(costBreakdown, null, 2),
-            },
-          ],
-        };
+        }, 'Cost breakdown with subscription correlation');
       }
 
       case 'get_subscription_details': {
         const { subscriptionId } = validatedArgs as any;
-        const result = await crayonClient.getSubscriptionById(subscriptionId);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getSubscriptionById(subscriptionId)
+        );
+        return createToolResponse(result);
       }
 
       case 'get_subscription_tags': {
         const { subscriptionId } = validatedArgs as any;
-        const result = await crayonClient.getSubscriptionTags(subscriptionId);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getSubscriptionTags(subscriptionId)
+        );
+        return createToolResponse(result);
       }
 
       case 'update_subscription_tags': {
         const { subscriptionId, tags } = validatedArgs as any;
-        const result = await crayonClient.updateSubscriptionTags(subscriptionId, tags);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                message: 'Tags updated successfully',
-                subscriptionId,
-                tags: result,
-              }, null, 2),
-            },
-          ],
-        };
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.updateSubscriptionTags(subscriptionId, tags)
+        );
+        return createToolResponse({ subscriptionId, tags: result }, 'Tags updated successfully');
       }
 
       case 'get_azure_plan_details': {
         const { azurePlanId } = validatedArgs as any;
-        const result = await crayonClient.getAzurePlan(azurePlanId);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getAzurePlan(azurePlanId)
+        );
+        return createToolResponse(result);
       }
 
       case 'get_azure_plan_subscriptions': {
         const { azurePlanId } = validatedArgs as any;
-        const result = await crayonClient.getAzurePlanSubscriptions(azurePlanId);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getAzurePlanSubscriptions(azurePlanId)
+        );
+        return createToolResponse(result);
       }
 
       case 'track_costs_by_tags': {
         const { organizationId, monthsBack = 3 } = validatedArgs as any;
-        const result = await crayonClient.getCostByTags(organizationId, monthsBack);
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getCostByTags(organizationId, monthsBack)
+        );
         
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                message: 'Cost tracking by subscription tags',
-                organizationId,
-                monthsBack,
-                data: result,
-              }, null, 2),
-            },
-          ],
-        };
+        return createToolResponse({ organizationId, monthsBack, data: result }, 'Cost tracking by subscription tags');
       }
 
       case 'get_azure_costs_by_date_range': {
         const { organizationId, from, to } = validatedArgs as any;
-        const result = await crayonClient.getAzureCostsByDateRange(organizationId, from, to);
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getAzureCostsByDateRange(organizationId, from, to)
+        );
         
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                message: 'Azure costs by date range',
-                organizationId,
-                from,
-                to,
-                data: result,
-              }, null, 2),
-            },
-          ],
-        };
+        return createToolResponse({ organizationId, from, to, data: result }, 'Azure costs by date range');
       }
 
       case 'get_azure_costs_by_subscription': {
         const { azurePlanId, subscriptionId, from, to } = validatedArgs as any;
-        const result = await crayonClient.getAzureCostsBySubscription(azurePlanId, subscriptionId, from, to);
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getAzureCostsBySubscription(azurePlanId, subscriptionId, from, to)
+        );
         
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                message: 'Azure costs by subscription',
-                azurePlanId,
-                subscriptionId,
-                from,
-                to,
-                data: result,
-              }, null, 2),
-            },
-          ],
-        };
+        return createToolResponse({ azurePlanId, subscriptionId, from, to, data: result }, 'Azure costs by subscription');
       }
 
       case 'get_cost_trends': {
         const { organizationId, monthsBack = 6 } = validatedArgs as any;
-        const result = await crayonClient.getCostTrends(organizationId, monthsBack);
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getCostTrends(organizationId, monthsBack)
+        );
         
         // Generate line chart if we have data
         if (result.trends && result.trends.length > 0) {
@@ -963,17 +881,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const formattedLabels = monthLabels.map((m: string) => formatMonthYear(m, locale));
           const costData = result.trends.map((t: any) => t.cost);
           
-          console.log(`[Chart] Generating line chart for ${formattedLabels.length} months`);
-          console.log(`[Chart] Cost range: ${Math.min(...costData)} - ${Math.max(...costData)}`);
-          
           const chartDataUrl = await chartGenerator.generateLineChart(
             formattedLabels,
             [{ label: 'Monthly Cost', data: costData }],
             `Cost Trends (Last ${monthsBack} Months)`,
             'Cost (NOK)'
           );
-          
-          console.log(`[Chart] Line chart generated, length: ${chartDataUrl.length}`);
           
           // Format summary text with localized month names
           const summary = result.summary;
@@ -1008,159 +921,80 @@ ${result.trends.map((t: any) => {
         }
         
         // Fallback: return JSON if no data for chart
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                message: 'Cost trends analysis - month over month comparison',
-                organizationId,
-                monthsBack,
-                data: result,
-              }, null, 2),
-            },
-          ],
-        };
+        return createToolResponse({ organizationId, monthsBack, data: result }, 'Cost trends analysis - month over month comparison');
       }
 
       case 'detect_cost_anomalies': {
         const { organizationId, monthsBack = 3, changeThresholdPercent = 25 } = validatedArgs as any;
-        const result = await crayonClient.detectCostAnomalies(organizationId, monthsBack, changeThresholdPercent);
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.detectCostAnomalies(organizationId, monthsBack, changeThresholdPercent)
+        );
         
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                message: 'Cost anomaly detection - subscriptions with significant changes',
-                organizationId,
-                monthsBack,
-                changeThresholdPercent,
-                data: result,
-              }, null, 2),
-            },
-          ],
-        };
+        return createToolResponse({ organizationId, monthsBack, changeThresholdPercent, data: result }, 'Cost anomaly detection - subscriptions with significant changes');
       }
 
       case 'analyze_costs_by_tags': {
         const { organizationId, monthsBack = 3 } = validatedArgs as any;
-        const result = await crayonClient.analyzeCostsByTags(organizationId, monthsBack);
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.analyzeCostsByTags(organizationId, monthsBack)
+        );
         
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                message: 'Cost analysis by tags - breakdown by CostCenter, Department, etc.',
-                organizationId,
-                monthsBack,
-                data: result,
-              }, null, 2),
-            },
-          ],
-        };
+        return createToolResponse({ organizationId, monthsBack, data: result }, 'Cost analysis by tags - breakdown by CostCenter, Department, etc.');
       }
 
       case 'find_similar_subscriptions_and_invoices': {
         const { organizationId, namePattern } = validatedArgs as any;
-        const result = await crayonClient.findSimilarSubscriptionsAndInvoices(organizationId, namePattern);
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.findSimilarSubscriptionsAndInvoices(organizationId, namePattern)
+        );
         
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                message: 'Similar subscriptions and their latest invoices',
-                organizationId,
-                namePattern,
-                data: result,
-              }, null, 2),
-            },
-          ],
-        };
+        return createToolResponse({ organizationId, namePattern, data: result }, 'Similar subscriptions and their latest invoices');
       }
 
       case 'list_all_subscriptions_with_tags': {
         const { organizationId } = validatedArgs as any;
-        const result = await crayonClient.listAllSubscriptionsWithTags(organizationId);
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.listAllSubscriptionsWithTags(organizationId)
+        );
         
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                message: 'All subscriptions with their tags',
-                organizationId: organizationId || 'all',
-                data: result,
-              }, null, 2),
-            },
-          ],
-        };
+        return createToolResponse({ organizationId: organizationId || 'all', data: result }, 'All subscriptions with their tags');
       }
 
       case 'get_last_month_costs_by_organization': {
         const { organizationId } = validatedArgs as any;
-        const result = await crayonClient.getLastMonthCostsByOrganization(organizationId);
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getLastMonthCostsByOrganization(organizationId)
+        );
         
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                message: 'Last month costs summary',
-                organizationId,
-                data: result,
-              }, null, 2),
-            },
-          ],
-        };
+        return createToolResponse({ organizationId, data: result }, 'Last month costs summary');
       }
 
       case 'get_last_month_costs_by_invoice_profile': {
         const { organizationId } = validatedArgs as any;
-        const result = await crayonClient.getLastMonthCostsByInvoiceProfile(organizationId);
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getLastMonthCostsByInvoiceProfile(organizationId)
+        );
         
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                message: 'Last month costs by invoice profile',
-                organizationId,
-                data: result,
-              }, null, 2),
-            },
-          ],
-        };
+        return createToolResponse({ organizationId, data: result }, 'Last month costs by invoice profile');
       }
 
       case 'get_last_month_costs_by_tags': {
         const { organizationId } = validatedArgs as any;
-        const result = await crayonClient.getLastMonthCostsByTags(organizationId);
+        const result = await executeWithCircuitBreaker(
+          () => crayonClient.getLastMonthCostsByTags(organizationId)
+        );
         
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                message: 'Last month costs broken down by tags',
-                organizationId,
-                data: result,
-              }, null, 2),
-            },
-          ],
-        };
+        return createToolResponse({ organizationId, data: result }, 'Last month costs broken down by tags');
       }
 
       case 'visualize_costs_pie_chart': {
         const { organizationId, monthsBack = 3, topN = 10, chartStyle = 'pie' } = validatedArgs as any;
         
-        console.log(`[Chart] Fetching billing data for org ${organizationId}, ${monthsBack} months`);
-        // Get billing data for the period
-        const billingDataResponse = await crayonClient.getHistoricalBilling(organizationId, monthsBack);
+        // Get billing data for the period with circuit breaker
+        const billingDataResponse = await executeWithCircuitBreaker(
+          () => crayonClient.getHistoricalBilling(organizationId, monthsBack)
+        );
         const billingData = Array.isArray(billingDataResponse) ? billingDataResponse : (billingDataResponse?.data || []);
-        console.log(`[Chart] Got ${billingData.length} billing records`);
         
         // Group by subscription and sum costs
         const subscriptionCosts = billingData.reduce((acc: any, item: any) => {
@@ -1170,8 +1004,6 @@ ${result.trends.map((t: any) => {
           return acc;
         }, {});
         
-        console.log(`[Chart] Grouped into ${Object.keys(subscriptionCosts).length} subscriptions`);
-        
         // Sort and take top N
         const sortedData = Object.entries(subscriptionCosts)
           .sort((a: any, b: any) => b[1] - a[1])
@@ -1180,9 +1012,6 @@ ${result.trends.map((t: any) => {
         const labels = sortedData.map(([name]) => name);
         const values = sortedData.map(([, cost]) => cost as number);
         const total = values.reduce((sum, val) => sum + val, 0);
-        
-        console.log(`[Chart] Top ${labels.length} subscriptions, total: $${total}`);
-        console.log(`[Chart] Generating ${chartStyle} chart...`);
         
         // Generate chart
         const chartDataUrl = chartStyle === 'doughnut'
@@ -1198,8 +1027,6 @@ ${result.trends.map((t: any) => {
               `Cost Distribution by Subscription (Last ${monthsBack} Months)`,
               'USD'
             );
-        
-        console.log(`[Chart] Chart generated, length: ${chartDataUrl.length}`);
         
         return {
           content: [
@@ -1226,8 +1053,7 @@ ${result.trends.map((t: any) => {
     const axiosError = error instanceof Error && (error as any).response;
     const statusCode = axiosError ? (error as any).response.status : 'unknown';
     
-    console.log(`[ERROR] Tool execution failed: ${name}`, errorMessage);
-    console.log(`[ERROR] Stack:`, error instanceof Error ? error.stack : 'No stack trace');
+    logger.error(`Tool execution failed: ${name}`, { errorMessage, stack: error instanceof Error ? error.stack : undefined });
     
     // Log full error for audit trail
     logger.error(`Tool execution error [${name}]`, {
@@ -1270,10 +1096,51 @@ ${result.trends.map((t: any) => {
 });
 
 // Determine transport mode
-const transportMode = process.env.TRANSPORT_MODE || 'http';
+const transportMode = config.transportMode;
 
 // Store transports by session ID for HTTP mode
 const transports: Record<string, StreamableHTTPServerTransport> = {};
+
+// Graceful shutdown handler
+let isShuttingDown = false;
+let httpServer: ReturnType<typeof import('http').createServer> | null = null;
+
+async function gracefulShutdown(signal: string) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  
+  console.log(`\n${signal} received. Starting graceful shutdown...`);
+  
+  // Stop accepting new connections
+  if (httpServer) {
+    httpServer.close(() => {
+      console.log('HTTP server closed');
+    });
+  }
+  
+  // Close all MCP sessions
+  const sessionIds = Object.keys(transports);
+  console.log(`Closing ${sessionIds.length} active sessions...`);
+  
+  for (const sessionId of sessionIds) {
+    try {
+      transports[sessionId].close();
+      delete transports[sessionId];
+    } catch (e) {
+      // Ignore close errors
+    }
+  }
+  
+  // Clear cache
+  responseCache.clear();
+  
+  console.log('Graceful shutdown complete');
+  process.exit(0);
+}
+
+// Register shutdown handlers
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 async function startServer() {
   if (transportMode === 'stdio') {
@@ -1288,57 +1155,119 @@ async function startServer() {
     // OWASP Security: A05:2021 - Security Misconfiguration
     app.disable('x-powered-by'); // Hide Express fingerprint
     
+    // Helmet for comprehensive security headers
+    app.use(helmet({
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'self'"],
+          scriptSrc: ["'self'"],
+          styleSrc: ["'self'"],
+          imgSrc: ["'self'", 'data:'],
+        },
+      },
+      hsts: {
+        maxAge: 31536000,
+        includeSubDomains: true,
+      },
+    }));
+    
+    // Compression middleware
+    app.use(compression());
+    
     // OWASP Security: A03:2021 - Injection
     app.use(express.json({ limit: '1mb' })); // Limit payload size to prevent DoS
     
-    // OWASP Security: A01:2021 - Broken Access Control
-    // Add security headers
-    app.use((_req, res, next) => {
-      res.setHeader('X-Content-Type-Options', 'nosniff');
-      res.setHeader('X-Frame-Options', 'DENY');
-      res.setHeader('X-XSS-Protection', '1; mode=block');
-      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-      res.setHeader('Content-Security-Policy', "default-src 'self'");
-      res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
+    // Apply rate limiting
+    app.use(rateLimiter);
+    
+    // Request ID middleware for tracing
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      const requestId = req.headers['x-request-id'] as string || randomUUID();
+      req.headers['x-request-id'] = requestId;
+      res.setHeader('X-Request-ID', requestId);
+      next();
+    });
+    
+    // Request timeout middleware
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      req.setTimeout(config.requestTimeoutMs, () => {
+        if (!res.headersSent) {
+          res.status(408).json({
+            jsonrpc: '2.0',
+            error: { code: -32000, message: 'Request timeout' },
+            id: null,
+          });
+        }
+      });
+      next();
+    });
+    
+    // Metrics tracking middleware
+    app.use((_req: Request, _res: Response, next: NextFunction) => {
+      metrics.requestCount++;
       next();
     });
 
     // Health check endpoint (no auth required)
     app.get('/health', (_req: Request, res: Response) => {
+      const uptime = Date.now() - metrics.startTime;
       res.json({ 
-        status: 'ok', 
-        server: 'crayon-cost-mcp', 
+        status: isShuttingDown ? 'shutting_down' : 'ok', 
+        server: 'crayon-cost-mcp',
+        version: '1.0.0',
         tools: tools.length,
+        uptime: Math.floor(uptime / 1000),
         timestamp: new Date().toISOString(),
+      });
+    });
+    
+    // Metrics endpoint for observability
+    app.get('/metrics', (_req: Request, res: Response) => {
+      const uptime = Date.now() - metrics.startTime;
+      res.json({
+        uptime: Math.floor(uptime / 1000),
+        requests: metrics.requestCount,
+        errors: metrics.errorCount,
+        circuitBreaker: {
+          trips: metrics.circuitBreakerTrips,
+          status: circuitBreaker.getStatus(),
+        },
+        cache: {
+          hits: metrics.cacheHits,
+          misses: metrics.cacheMisses,
+          size: responseCache.size(),
+          hitRate: metrics.cacheHits + metrics.cacheMisses > 0 
+            ? (metrics.cacheHits / (metrics.cacheHits + metrics.cacheMisses) * 100).toFixed(1) + '%'
+            : 'N/A',
+        },
+        sessions: Object.keys(transports).length,
+        toolCalls: metrics.toolCalls,
       });
     });
 
     // Apply authentication middleware to /mcp endpoint
-    if (AUTH_ENABLED) {
+    if (config.authEnabled) {
       app.use('/mcp', authenticateRequest);
     }
 
     // MCP Streamable HTTP endpoint - handles all GET/POST/DELETE requests
     app.all('/mcp', async (req: Request, res: Response) => {
-      console.log(`Received ${req.method} request to /mcp`);
-      
       try {
         const sessionId = req.headers['mcp-session-id'] as string | undefined;
-        console.log(`[HTTP Request] Session ID: ${sessionId}, Method: ${req.method}, Body method: ${req.body?.method}`);
         let transport: StreamableHTTPServerTransport;
 
         if (sessionId && transports[sessionId]) {
           // Reuse existing transport for this session
-          console.log(`[Session] Found transport for session ${sessionId}`);
           transport = transports[sessionId];
+          // Update last activity timestamp for session cleanup
+          (transport as any).lastActivity = Date.now();
         } else if (!sessionId && req.method === 'POST' && req.body?.method === 'initialize') {
           // Create new transport for initialization request
-          console.log(`[Session] Creating new transport for initialization`);
           transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
             onsessioninitialized: (newSessionId) => {
-              console.log(`StreamableHTTP session initialized with ID: ${newSessionId}`);
               transports[newSessionId] = transport;
+              (transport as any).lastActivity = Date.now();
             }
           });
 
@@ -1346,7 +1275,6 @@ async function startServer() {
           transport.onclose = () => {
             const sid = transport.sessionId;
             if (sid && transports[sid]) {
-              console.log(`Transport closed for session ${sid}, removing from transports map`);
               delete transports[sid];
             }
           };
@@ -1369,7 +1297,8 @@ async function startServer() {
         // Let the transport handle the request according to MCP protocol
         await transport.handleRequest(req, res, req.body);
       } catch (error) {
-        console.error('Error handling MCP request:', error);
+        logger.error('Error handling MCP request', { error: error instanceof Error ? error.message : 'Unknown' });
+        metrics.errorCount++;
         if (!res.headersSent) {
           res.status(500).json({
             jsonrpc: '2.0',
@@ -1383,37 +1312,58 @@ async function startServer() {
       }
     });
 
-    app.listen(PORT, HOST, () => {
+    httpServer = app.listen(config.port, config.host, () => {
       console.log(`\n${'='.repeat(80)}`);
-      console.log(`Crayon Cost MCP server running on http://${HOST}:${PORT}`);
-      console.log(`Health check: http://${HOST}:${PORT}/health`);
-      console.log(`MCP endpoint: http://${HOST}:${PORT}/mcp`);
+      console.log(`Crayon Cost MCP server running on http://${config.host}:${config.port}`);
+      console.log(`Health check: http://${config.host}:${config.port}/health`);
+      console.log(`Metrics:      http://${config.host}:${config.port}/metrics`);
+      console.log(`MCP endpoint: http://${config.host}:${config.port}/mcp`);
       console.log(`${'='.repeat(80)}\n`);
       
       // Display authentication instructions for production use
-      if (AUTH_ENABLED) {
-        const authToken = process.env.AUTH_TOKEN || 'NOT_SET';
-        console.log('AUTHENTICATION TOKEN:');
+      if (config.authEnabled) {
+        const authToken = config.authToken || 'NOT_SET';
+        // Only show partial token for security
+        const maskedToken = authToken.length > 8 
+          ? `${authToken.substring(0, 4)}...${authToken.substring(authToken.length - 4)}`
+          : '****';
+        console.log('AUTHENTICATION ENABLED');
         console.log(`${'─'.repeat(80)}`);
-        console.log(`Token: ${authToken}`);
+        console.log(`Token (masked): ${maskedToken}`);
+        console.log(`Full token available in AUTH_TOKEN environment variable`);
         console.log(`${'─'.repeat(80)}`);
         console.log('\nUsage in MCP requests:');
-        console.log(`curl -X POST http://localhost:${PORT}/mcp \\`);
-        console.log(`  -H "Authorization: Bearer ${authToken}" \\`);
+        console.log(`curl -X POST http://localhost:${config.port}/mcp \\`);
+        console.log(`  -H "Authorization: Bearer $AUTH_TOKEN" \\`);
         console.log(`  -H "Content-Type: application/json" \\`);
         console.log(`  -d '{...}'`);
         console.log('\n');
-        
-        // Log token display for audit trail
-        logger.info('MCP Server started with authentication enabled', {
-          tokenSet: authToken !== 'NOT_SET',
-          timestamp: new Date().toISOString(),
-        });
       }
       
-      if (process.env.NODE_ENV !== 'production') {
+      if (config.nodeEnv !== 'production') {
         console.log('Running in development mode');
       }
+      
+      // Start session cleanup interval
+      setInterval(() => {
+        if (isShuttingDown) return;
+        
+        const now = Date.now();
+        for (const [sessionId, transport] of Object.entries(transports)) {
+          const lastActivity = (transport as any).lastActivity || 0;
+          if (now - lastActivity > config.sessionTimeoutMs) {
+            try {
+              transport.close();
+            } catch (e) {
+              // Ignore close errors
+            }
+            delete transports[sessionId];
+          }
+        }
+        
+        // Also cleanup expired cache entries
+        responseCache.cleanup();
+      }, config.sessionCleanupIntervalMs);
     });
   }
 }
@@ -1423,4 +1373,3 @@ startServer().catch((error) => {
   console.error('Failed to start server:', error);
   process.exit(1);
 });
-

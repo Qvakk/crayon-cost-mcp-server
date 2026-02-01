@@ -1,6 +1,17 @@
 import { Request, Response, NextFunction } from 'express';
 import { logger } from './logger.js';
 
+// Load allowed organizations from environment variable
+// Format: comma-separated list of organization IDs (e.g., "4040561,4019092")
+const ALLOWED_ORGANIZATIONS = (process.env.ALLOWED_ORGANIZATIONS || '')
+  .split(',')
+  .map(id => parseInt(id.trim(), 10))
+  .filter(id => !isNaN(id));
+
+if (ALLOWED_ORGANIZATIONS.length === 0) {
+  console.warn('WARNING: ALLOWED_ORGANIZATIONS not set. Access will be restricted.');
+}
+
 // Extend Express Request to include user
 declare global {
   namespace Express {
@@ -24,7 +35,7 @@ export function authenticateRequest(req: Request, res: Response, next: NextFunct
     req.user = {
       id: 'dev-user',
       email: 'dev@example.com',
-      organizations: [4040561, 4019092], // All orgs for dev
+      organizations: ALLOWED_ORGANIZATIONS,
       roles: ['admin'],
     };
     return next();
@@ -38,14 +49,14 @@ export function authenticateRequest(req: Request, res: Response, next: NextFunct
     req.user = {
       id: 'anonymous',
       email: 'anonymous@crayon-cost-mcp.local',
-      organizations: [4040561, 4019092], // All orgs for now
+      organizations: ALLOWED_ORGANIZATIONS,
       roles: ['viewer'],
     };
     return next();
   }
 
   if (!authHeader) {
-    logger.warn('Unauthorized: Missing authorization header');
+    logger.error('Authentication failed: Missing authorization header');
     res.status(401).json({ error: 'Unauthorized: Missing authorization header' });
     return;
   }
@@ -53,7 +64,7 @@ export function authenticateRequest(req: Request, res: Response, next: NextFunct
   const token = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
 
   if (!token) {
-    logger.warn('Unauthorized: Missing authentication token');
+    logger.error('Authentication failed: Missing token');
     res.status(401).json({ error: 'Unauthorized: Missing authentication token' });
     return;
   }
@@ -68,7 +79,7 @@ export function authenticateRequest(req: Request, res: Response, next: NextFunct
   }
 
   if (token !== validToken) {
-    logger.warn('Invalid token provided');
+    logger.error('Authentication failed: Invalid token');
     res.status(401).json({ error: 'Invalid authentication token' });
     return;
   }
@@ -77,7 +88,7 @@ export function authenticateRequest(req: Request, res: Response, next: NextFunct
   req.user = {
     id: 'api-user',
     email: 'api@crayon-cost-mcp.local',
-    organizations: [4040561, 4019092], // All orgs
+    organizations: ALLOWED_ORGANIZATIONS,
     roles: ['admin'],
   };
 
@@ -104,10 +115,8 @@ export function authorizeOrganization(requiredRole: string = 'viewer') {
 
     // Check if user has access to this organization
     if (!req.user.organizations.includes(parseInt(organizationId))) {
-      logger.warn('Unauthorized access attempt', {
-        userId: req.user.id,
+      logger.error('Authorization failed: Access denied to organization', {
         attemptedOrgId: organizationId,
-        allowedOrgs: req.user.organizations,
       });
       res.status(403).json({ error: `Forbidden: No access to organization ${organizationId}` });
       return;
@@ -116,10 +125,8 @@ export function authorizeOrganization(requiredRole: string = 'viewer') {
     // Check role requirements
     const hasRole = req.user.roles.includes(requiredRole) || req.user.roles.includes('admin');
     if (!hasRole) {
-      logger.warn('Insufficient role', {
-        userId: req.user.id,
+      logger.error('Authorization failed: Insufficient role', {
         requiredRole,
-        userRoles: req.user.roles,
       });
       res.status(403).json({ error: `Forbidden: Requires ${requiredRole} role` });
       return;

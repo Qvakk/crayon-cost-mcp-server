@@ -1,19 +1,19 @@
-FROM node:22-alpine AS builder
+# Use Debian-based image for better canvas/native module compatibility
+FROM node:22-slim AS builder
 
 WORKDIR /app
 
-# Install build dependencies for canvas (including Python)
-RUN apk add --no-cache \
+# Install build dependencies for canvas
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     make \
     g++ \
-    cairo-dev \
-    pango-dev \
-    giflib-dev \
-    pixman-dev \
-    libjpeg-turbo-dev \
-    freetype-dev \
-    fontconfig-dev
+    libcairo2-dev \
+    libpango1.0-dev \
+    libgif-dev \
+    libjpeg-dev \
+    librsvg2-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy package files
 COPY package*.json ./
@@ -28,46 +28,36 @@ COPY src ./src
 # Build TypeScript
 RUN npm run build
 
-# Production stage
-FROM node:22-alpine
+# Production stage - use slim for smaller size
+FROM node:22-slim
 
-# Install canvas dependencies AND build tools for Chart.js rendering
-RUN apk add --no-cache \
-    python3 \
-    make \
-    g++ \
-    cairo \
-    cairo-dev \
-    pango \
-    pango-dev \
-    giflib \
-    giflib-dev \
-    pixman \
-    pixman-dev \
-    libjpeg-turbo \
-    libjpeg-turbo-dev \
-    freetype \
-    freetype-dev \
-    fontconfig \
-    fontconfig-dev \
-    ttf-dejavu \
-    ttf-liberation \
-    font-noto
+# Install runtime dependencies for canvas
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libcairo2 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libgif7 \
+    libjpeg62-turbo \
+    librsvg2-2 \
+    fonts-dejavu-core \
+    fonts-liberation \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Copy package files
 COPY package*.json ./
 
-# Install production dependencies only
+# Install production dependencies only (canvas will use prebuilt binaries)
 RUN npm ci --omit=dev
 
 # Copy built files from builder
 COPY --from=builder /app/dist ./dist
 
 # Create non-root user and logs directory
-RUN addgroup -g 1001 -S nodejs && \
-    adduser -S nodejs -u 1001 && \
+RUN groupadd -g 1001 nodejs && \
+    useradd -m -u 1001 -g nodejs nodejs && \
     mkdir -p /app/logs && \
     chown -R nodejs:nodejs /app
 
@@ -75,6 +65,10 @@ USER nodejs
 
 # Expose port
 EXPOSE 3003
+
+# Health check using wget (available in slim)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:3003/health || exit 1
 
 # Set environment variable for production
 ENV NODE_ENV=production
