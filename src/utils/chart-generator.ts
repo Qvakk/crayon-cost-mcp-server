@@ -12,8 +12,6 @@ import { getCurrentLocale } from './localization.js';
  * Note: Requires canvas dependencies. Works automatically in Docker.
  */
 export class ChartGenerator {
-  private width: number;
-  private height: number;
   private chartJSNodeCanvas: ChartJSNodeCanvas;
   private locale = getCurrentLocale();
 
@@ -36,8 +34,6 @@ export class ChartGenerator {
   };
 
   constructor(width: number = 800, height: number = 600) {
-    this.width = width;
-    this.height = height;
     this.chartJSNodeCanvas = new ChartJSNodeCanvas({ 
       width, 
       height,
@@ -261,7 +257,7 @@ export class ChartGenerator {
           tooltip: {
             callbacks: {
               label: (context) => {
-                const value = context.parsed.y;
+                const value = context.parsed.y ?? 0;
                 return `${context.dataset.label}: ${value.toLocaleString()}`;
               }
             }
@@ -334,9 +330,11 @@ export class ChartGenerator {
               label: (context) => {
                 const point = context.parsed;
                 const label = pointLabels ? pointLabels[context.dataIndex] : '';
+                const x = point.x ?? 0;
+                const y = point.y ?? 0;
                 return label 
-                  ? `${label}: (${point.x.toFixed(2)}, ${point.y.toFixed(2)})`
-                  : `(${point.x.toFixed(2)}, ${point.y.toFixed(2)})`;
+                  ? `${label}: (${x.toFixed(2)}, ${y.toFixed(2)})`
+                  : `(${x.toFixed(2)}, ${y.toFixed(2)})`;
               }
             }
           }

@@ -82,6 +82,10 @@ export class CrayonApiClient {
       this.accessToken = token;
       this.tokenExpiry = now + expiresIn;
       
+      if (!this.accessToken) {
+        throw new Error('No access token received from API');
+      }
+      
       return this.accessToken;
     } catch (error) {
       throw new Error(`Authentication failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -304,7 +308,7 @@ export class CrayonApiClient {
    * Get historical billing data for multiple months
    */
   async getHistoricalBilling(organizationId: number, monthsBack: number = 6, invoiceProfileId?: number): Promise<any> {
-    const token = await this.authenticate();
+    await this.authenticate();
     
     const endDate = new Date();
     const startDate = new Date();
@@ -409,7 +413,7 @@ export class CrayonApiClient {
    * Get cost tracking by subscription tags
    */
   async getCostByTags(organizationId: number, monthsBack: number = 3): Promise<any> {
-    const token = await this.authenticate();
+    await this.authenticate();
     
     // Get subscriptions and billing data
     const [subscriptions, billingData] = await Promise.all([
@@ -481,14 +485,6 @@ export class CrayonApiClient {
     const token = await this.authenticate();
     
     try {
-      // Parse dates to get year and month
-      const fromDate = new Date(from);
-      const toDate = new Date(to);
-
-      // For simplicity, use the start month/year if dates don't align
-      const year = fromDate.getFullYear();
-      const month = fromDate.getMonth() + 1;
-
       const response = await this.apiClient.get(
         `/usagecost/resellerCustomer/${azurePlanId}/subscription/${subscriptionId}/category/azure/?from=${from}&to=${to}`,
         {
@@ -527,7 +523,7 @@ export class CrayonApiClient {
    * Get cost trends over multiple months
    */
   async getCostTrends(organizationId: number, monthsBack: number = 6): Promise<any> {
-    const token = await this.authenticate();
+    await this.authenticate();
     
     const historicalData = await this.getHistoricalBilling(organizationId, monthsBack);
     const costsByMonth: { [key: string]: number } = {};
@@ -585,7 +581,7 @@ export class CrayonApiClient {
    * Detect cost anomalies - find subscriptions with significant changes
    */
   async detectCostAnomalies(organizationId: number, monthsBack: number = 3, changeThresholdPercent: number = 25): Promise<any> {
-    const token = await this.authenticate();
+    await this.authenticate();
     
     // Get subscriptions and their cost history
     const subscriptions = await this.getSubscriptions(organizationId);
@@ -651,7 +647,7 @@ export class CrayonApiClient {
    * Analyze costs by tags (cost centers, departments, etc.)
    */
   async analyzeCostsByTags(organizationId: number, monthsBack: number = 3): Promise<any> {
-    const token = await this.authenticate();
+    await this.authenticate();
     
     // Get all subscriptions with their tags
     const subscriptions = await this.getSubscriptions(organizationId);
@@ -711,7 +707,7 @@ export class CrayonApiClient {
    * Find subscriptions by name pattern and get their latest invoice
    */
   async findSimilarSubscriptionsAndInvoices(organizationId: number, namePattern: string): Promise<any> {
-    const token = await this.authenticate();
+    await this.authenticate();
     
     // Get all subscriptions
     const subscriptions = await this.getSubscriptions(organizationId);
@@ -755,7 +751,7 @@ export class CrayonApiClient {
    * List all subscriptions with their tags for verification and auditing
    */
   async listAllSubscriptionsWithTags(organizationId?: number): Promise<any> {
-    const token = await this.authenticate();
+    await this.authenticate();
     
     // Get all subscriptions
     const subscriptions = await this.getSubscriptions(organizationId);
@@ -798,7 +794,7 @@ export class CrayonApiClient {
    * Get last month costs summary by organization
    */
   async getLastMonthCostsByOrganization(organizationId: number): Promise<any> {
-    const token = await this.authenticate();
+    await this.authenticate();
     
     // Calculate last month's date range
     const today = new Date();
@@ -836,7 +832,7 @@ export class CrayonApiClient {
    * Get last month costs breakdown by invoice profile
    */
   async getLastMonthCostsByInvoiceProfile(organizationId: number): Promise<any> {
-    const token = await this.authenticate();
+    await this.authenticate();
     
     // Get invoice profiles
     const profiles = await this.getInvoiceProfiles(organizationId);
@@ -901,7 +897,7 @@ export class CrayonApiClient {
    * Get last month costs breakdown by tags (CostCenter, Department, etc.)
    */
   async getLastMonthCostsByTags(organizationId: number): Promise<any> {
-    const token = await this.authenticate();
+    await this.authenticate();
     
     // Get all subscriptions with tags
     const subscriptions = await this.getSubscriptions(organizationId);

@@ -96,9 +96,9 @@ The server provides **26 tools** for comprehensive cost analysis:
 
 ### Advanced Analytics & Visualization
 - **`get_historical_costs`** - Multi-month cost history for forecasting
-- **`get_cost_by_subscription`** - 📊 Cost breakdown by subscription with **pie/doughnut chart**
+- **`get_cost_by_subscription`** - Cost breakdown by subscription with **pie/doughnut chart**
 - **`track_costs_by_tags`** - Cost allocation by tags (department, project, environment)
-- **`get_cost_trends`** - 📈 Month-over-month trends with **line chart visualization**
+- **`get_cost_trends`** - Month-over-month trends with **line chart visualization**
 - **`detect_cost_anomalies`** - Identify subscriptions with unexpected cost spikes
 - **`analyze_costs_by_tags`** - Breakdown costs by CostCenter, Department, Project, etc.
 - **`find_similar_subscriptions_and_invoices`** - Find related subscriptions by name pattern
@@ -107,11 +107,11 @@ The server provides **26 tools** for comprehensive cost analysis:
 - **`get_last_month_costs_by_organization`** - Last month total by organization
 
 ### Key Features
-- ✅ All historical cost tools use **complete billing months** (start from 1st of month)
-- 📊 **Chart visualization** for trend analysis and cost distribution
-- 🔤 **Proper font rendering** with DejaVu Sans, Liberation, and Noto fonts
-- 🔍 **Correlation tools** to link billing data with Azure/AWS resources
-- 🏷️ **Tag-based analytics** for departmental cost allocation
+- All historical cost tools use **complete billing months** (start from 1st of month)
+- **Chart visualization** for trend analysis and cost distribution
+- **Proper font rendering** with DejaVu Sans, Liberation, and Noto fonts
+- **Correlation tools** to link billing data with Azure/AWS resources
+- **Tag-based analytics** for departmental cost allocation
 
 ## Support
 
