@@ -157,7 +157,7 @@ export const schemas = {
   }),
 
   list_all_subscriptions_with_tags: Joi.object({
-    organizationId: positiveInteger,
+    organizationId: optionalInteger,
     page: pageNumber,
     pageSize: pageSize,
   }),
@@ -165,6 +165,19 @@ export const schemas = {
   get_historical_costs: Joi.object({
     organizationId: positiveInteger,
     monthsBack: Joi.number().integer().min(1).max(24).default(6),
+  }),
+
+  get_azure_costs_by_date_range: Joi.object({
+    organizationId: positiveInteger,
+    from: isoDate.required(),
+    to: isoDate.required(),
+  }),
+
+  get_azure_costs_by_subscription: Joi.object({
+    azurePlanId: positiveInteger,
+    subscriptionId: positiveInteger,
+    from: isoDate.required(),
+    to: isoDate.required(),
   }),
 
   get_last_month_costs_by_tags: Joi.object({
@@ -202,7 +215,7 @@ export async function validateToolInput(toolName: string, args: any): Promise<an
     const validated = await schema.validateAsync(args, {
       abortEarly: false,
       convert: true,
-      stripUnknown: false,
+      stripUnknown: true,
     });
     return validated;
   } catch (e) {
