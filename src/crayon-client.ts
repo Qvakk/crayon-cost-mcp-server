@@ -1,4 +1,5 @@
 import axios, { AxiosInstance } from 'axios';
+import { logger } from './middleware/logger.js';
 
 interface CrayonAuthResponse {
   access_token: string;
@@ -461,7 +462,7 @@ export class CrayonApiClient {
       return response.data;
     } catch (error) {
       // Fallback: aggregate billing statements
-      console.warn(`Organization-level cost endpoint failed, using billing statements fallback`);
+      logger.error('Organization-level cost endpoint failed, using billing statements fallback');
       const billingData = await this.getGroupedBillingStatements({
         organizationId,
         from,
@@ -497,7 +498,7 @@ export class CrayonApiClient {
       return response.data;
     } catch (error) {
       // Fallback: try to get Azure usage CSV
-      console.warn(`Subscription-level cost endpoint failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      logger.error('Subscription-level cost endpoint failed, using fallback');
       
       const fromDate = new Date(from);
       const year = fromDate.getFullYear();

@@ -1,4 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
+import { timingSafeEqual } from 'node:crypto';
 import { logger } from './logger.js';
 
 // Load allowed organizations from environment variable
@@ -78,7 +79,10 @@ export function authenticateRequest(req: Request, res: Response, next: NextFunct
     return;
   }
 
-  if (token !== validToken) {
+  // Use constant-time comparison to prevent timing attacks
+  const tokenBuffer = Buffer.from(token);
+  const validBuffer = Buffer.from(validToken);
+  if (tokenBuffer.length !== validBuffer.length || !timingSafeEqual(tokenBuffer, validBuffer)) {
     logger.error('Authentication failed: Invalid token');
     res.status(401).json({ error: 'Invalid authentication token' });
     return;

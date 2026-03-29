@@ -1104,6 +1104,7 @@ const transports: Record<string, StreamableHTTPServerTransport> = {};
 // Graceful shutdown handler
 let isShuttingDown = false;
 let httpServer: ReturnType<typeof import('http').createServer> | null = null;
+let sessionCleanupInterval: ReturnType<typeof setInterval> | null = null;
 
 async function gracefulShutdown(signal: string) {
   if (isShuttingDown) return;
@@ -1116,6 +1117,12 @@ async function gracefulShutdown(signal: string) {
     httpServer.close(() => {
       console.log('HTTP server closed');
     });
+  }
+  
+  // Clear cleanup interval
+  if (sessionCleanupInterval) {
+    clearInterval(sessionCleanupInterval);
+    sessionCleanupInterval = null;
   }
   
   // Close all MCP sessions
@@ -1245,9 +1252,10 @@ async function startServer() {
       });
     });
 
-    // Apply authentication middleware to /mcp endpoint
+    // Apply authentication middleware to /mcp and /metrics endpoints
     if (config.authEnabled) {
       app.use('/mcp', authenticateRequest);
+      app.use('/metrics', authenticateRequest);
     }
 
     // MCP Streamable HTTP endpoint - handles all GET/POST/DELETE requests
@@ -1345,7 +1353,7 @@ async function startServer() {
       }
       
       // Start session cleanup interval
-      setInterval(() => {
+      sessionCleanupInterval = setInterval(() => {
         if (isShuttingDown) return;
         
         const now = Date.now();
