@@ -1240,11 +1240,14 @@ function createServer(): Server {
 }
 
 // MCP entry serving the latest (2026-07-28) protocol revision.
-// `legacy: 'reject'` declines 2025-era clients with an explicit
-// "Unsupported protocol version" error rather than silently serving them, so
-// every caller speaks the same, current wire contract.
+// `legacy: 'stateless'` additionally serves 2025-era clients through the SDK's
+// built-in stateless fallback (no mcp-session-id issued; GET/DELETE answered
+// 405). VS Code's MCP client currently speaks the 2025-era handshake and falls
+// back to it after a 400 on the modern path, so 'reject' breaks every VS Code
+// connection with a 405 SSE error. Verbatim JSON-RPC passthrough is identical
+// for both eras — the gate is the JWT, not the protocol era.
 const mcpHandler = createMcpHandler(createServer, {
-  legacy: 'reject',
+  legacy: 'stateless',
   onerror: (error) => {
     metrics.errorCount++;
     logger.error('MCP handler error', { error: error.message });
