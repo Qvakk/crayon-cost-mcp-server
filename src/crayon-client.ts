@@ -1,6 +1,62 @@
 import axios, { AxiosInstance } from 'axios';
 import { logger } from './middleware/logger.js';
 
+/**
+ * Normalises a Crayon list response to an array.
+ *
+ * The Crayon API returns **bare arrays** for every collection endpoint
+ * (`/BillingStatements`, `/Subscriptions`, `/Invoices`, `/Organizations`, …).
+ * Some endpoints/proxies still wrap results in an `{ Items: [...] }` envelope,
+ * and paginated payloads may carry `TotalHits`. Reading `.Items` unconditionally
+ * therefore silently yields `undefined` and turns every aggregate into zero, so
+ * all list access goes through this helper.
+ */
+export function unwrapList<T = any>(payload: unknown): T[] {
+  if (Array.isArray(payload)) return payload as T[];
+  if (payload && typeof payload === 'object') {
+    const record = payload as Record<string, unknown>;
+    for (const key of ['Items', 'items', 'value', 'Value', 'data', 'Results']) {
+      if (Array.isArray(record[key])) return record[key] as T[];
+    }
+  }
+  return [];
+}
+
+/**
+ * Extracts a monetary amount from a Crayon value shape.
+ *
+ * `BillingStatement.totalSalesPrice` and `GroupedBillingStatement.totalSalesPrice`
+ * are `Price` objects (`{ value, currencyCode }`), while usage-cost endpoints
+ * return a bare `amount` number. A raw `TotalSalesPrice` read yields an object,
+ * which makes every sum `NaN`/0 — so amounts are always read through here.
+ */
+export function priceValue(cost: unknown): number {
+  if (typeof cost === 'number') return Number.isFinite(cost) ? cost : 0;
+  if (typeof cost === 'string') {
+    const parsed = Number(cost);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  if (cost && typeof cost === 'object') {
+    const record = cost as Record<string, unknown>;
+    for (const key of ['value', 'Value', 'amount', 'Amount']) {
+      const v = record[key];
+      if (typeof v === 'number' && Number.isFinite(v)) return v;
+      if (typeof v === 'string') {
+        const parsed = Number(v);
+        if (Number.isFinite(parsed)) return parsed;
+      }
+    }
+  }
+  return 0;
+}
+
+/** Extracts the currency code from a Crayon value shape. */
+export function priceCurrency(cost: unknown, fallback = 'NOK'): string {
+  const record = (cost ?? {}) as Record<string, unknown>;
+  const code = record.currencyCode ?? record.CurrencyCode;
+  return typeof code === 'string' && code ? code : fallback;
+}
+
 interface CrayonAuthResponse {
   access_token: string;
   token_type: string;
@@ -30,15 +86,29 @@ export class CrayonApiClient {
   private accessToken: string | null = null;
   private tokenExpiry: number = 0;
 
+  /**
+   * Reference cache for slow-changing lookups that would otherwise be re-fetched
+   * once per tool call (e.g. a customer tenant's Azure plan). Billing and cost
+   * data is deliberately never cached — stale financial figures are worse than a
+   * repeated call.
+   */
+  private readonly azurePlanByTenant = new Map<number, any>();
+
   constructor(
     private clientId: string,
     private clientSecret: string,
     private username: string,
     private password: string,
-    private baseUrl: string = 'https://api.crayon.com/api/v1'
+    private baseUrl: string = 'https://api.crayon.com/api/v1',
+    /** Per-request timeout in ms. Keeps a stalled API from hanging a tool call. */
+    private requestTimeoutMs: number = 30_000
   ) {
     this.apiClient = axios.create({
       baseURL: this.baseUrl,
+      // Hard timeout per Crayon request. Without it a stalled connection blocks
+      // the circuit breaker's own timeout from ever being the limiting factor,
+      // and the caller waits indefinitely.
+      timeout: this.requestTimeoutMs,
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
@@ -47,20 +117,134 @@ export class CrayonApiClient {
   }
 
   /**
-   * Authenticate with Crayon API and get access token
+   * Authenticated GET. Centralises token acquisition so callers never have to
+   * repeat the `authenticate()` + header boilerplate.
+   */
+  private async get(path: string): Promise<any> {
+    const token = await this.authenticate();
+    const response = await this.apiClient.get(path, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return response.data;
+  }
+
+  /** Authenticated POST. */
+  private async post(path: string, body?: unknown): Promise<any> {
+    const token = await this.authenticate();
+    return (await this.apiClient.post(path, body, {
+      headers: { Authorization: `Bearer ${token}` },
+    })).data;
+  }
+
+  /**
+   * Fetches every page of a paginated Crayon collection endpoint.
+   *
+   * The API exposes no total count and no cursor, so a single request silently
+   * truncates and an aggregate would report a partial dataset as complete.
+   *
+   * Termination deliberately does **not** use "page came back shorter than the
+   * requested size" as an end-of-data signal. The spec declares no maximum
+   * `PageSize`, so the server may cap it; if it caps below what we ask for, every
+   * page would look short and that heuristic would stop after a single request —
+   * reintroducing the very truncation this exists to prevent. The walk stops only
+   * on an empty page, which is correct regardless of any server-side cap. The
+   * cost is one extra (small, empty) request at the end, which is a fair trade
+   * against reporting spend from a partial dataset.
+   *
+   * No client-side de-duplication is performed. Rows are not guaranteed to carry
+   * a unique `id` (e.g. `GroupedBillingStatement` has both `groupId` and `id` and
+   * repeats across billing periods, and usage-cost rows have no id at all), so
+   * deduping individual rows risks dropping legitimate ones from a total.
+   * Instead, progress is judged at the **page boundary**: if a page starts with
+   * the same row as the previous page, the server is replaying a page rather than
+   * advancing, so the walk stops. That detects a server ignoring `Page` without
+   * ever discarding a distinct row.
+   *
+   * @param buildUrl Produces the URL for a given 1-based page number.
+   * @param maxPages Safety cap on requests (bounds the total rows fetched).
+   */
+  private async getAllPages(
+    buildUrl: (page: number) => string,
+    maxPages: number = 20
+  ): Promise<any[]> {
+    const collected: any[] = [];
+    let previousFirstRow: string | null = null;
+
+    for (let page = 1; page <= maxPages; page++) {
+      const batch = unwrapList(await this.get(buildUrl(page)));
+
+      if (batch.length === 0) break; // past the end of the collection
+
+      // Page-boundary progress check: identical first row => page did not advance.
+      const firstRow = JSON.stringify(batch[0]);
+      if (firstRow === previousFirstRow) {
+        logger.warn('Pagination did not advance; stopping to avoid duplicate rows', {
+          endpoint: buildUrl(page).split('?')[0],
+          page,
+          collected: collected.length,
+        });
+        break;
+      }
+      previousFirstRow = firstRow;
+
+      collected.push(...batch);
+
+      if (page === maxPages) {
+        logger.warn('Pagination cap reached; results may be incomplete', {
+          endpoint: buildUrl(page).split('?')[0],
+          collected: collected.length,
+          maxPages,
+        });
+      }
+    }
+
+    return collected;
+  }
+
+  /**
+   * Authenticate with Crayon API and get access token.
+   *
+   * The in-flight promise is memoized so concurrent tool calls hitting an expired
+   * token trigger exactly **one** token request (a thundering herd here would
+   * otherwise fire N simultaneous auth calls and risk the provider rate-limiting
+   * or rejecting the credentials).
    */
   private async authenticate(): Promise<string> {
     const now = Date.now() / 1000;
-    
-    // Return cached token if still valid
+
+    // Return cached token if still valid (60s safety margin before expiry).
     if (this.accessToken && this.tokenExpiry > now + 60) {
       return this.accessToken;
     }
 
+    // Coalesce concurrent refreshes onto a single in-flight request.
+    if (this.tokenRefresh) {
+      return this.tokenRefresh;
+    }
+
+    this.tokenRefresh = this.requestToken()
+      .then((token) => {
+        this.accessToken = token;
+        this.tokenExpiry = Date.now() / 1000 + this.currentExpiresIn;
+        return token;
+      })
+      .finally(() => {
+        this.tokenRefresh = null;
+      });
+
+    return this.tokenRefresh;
+  }
+
+  /** Holds the in-flight token refresh, if any. */
+  private tokenRefresh: Promise<string> | null = null;
+  private currentExpiresIn: number = 3600;
+
+  /** Performs the actual token request and stores the resulting TTL. */
+  private async requestToken(): Promise<string> {
+    // Crayon API requires Basic Authentication (client_id:client_secret) in Authorization header
+    const auth = Buffer.from(`${this.clientId}:${this.clientSecret}`).toString('base64');
+
     try {
-      // Crayon API requires Basic Authentication (client_id:client_secret) in Authorization header
-      const auth = Buffer.from(`${this.clientId}:${this.clientSecret}`).toString('base64');
-      
       const response = await axios.post<CrayonAuthResponse>(
         `${this.baseUrl}/connect/token`,
         new URLSearchParams({
@@ -73,277 +257,240 @@ export class CrayonApiClient {
             'Content-Type': 'application/x-www-form-urlencoded',
             'Authorization': `Basic ${auth}`,
           },
+          timeout: this.requestTimeoutMs,
         }
       );
 
       // Crayon API returns AccessToken (PascalCase), not access_token
       const token = response.data.access_token || (response.data as any).AccessToken;
       const expiresIn = response.data.expires_in || (response.data as any).ExpiresIn || 3600;
-      
-      this.accessToken = token;
-      this.tokenExpiry = now + expiresIn;
-      
-      if (!this.accessToken) {
+      this.currentExpiresIn = expiresIn;
+
+      if (!token) {
         throw new Error('No access token received from API');
       }
-      
-      return this.accessToken;
+
+      return token;
     } catch (error) {
       throw new Error(`Authentication failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
   /**
-   * Get billing statements with filters
+   * Get billing statements with filters.
+   * Spec: GET /api/v1/BillingStatements (query: InvoiceProfileId, OrganizationId,
+   * ProvisionType, From, To, Page, PageSize) -> BillingStatement[]
    */
-  async getBillingStatements(filter: BillingStatementFilter): Promise<any> {
-    const token = await this.authenticate();
-    
+  /**
+   * Get billing statements with filters.
+   *
+   * Paged explicitly: this backs the paginated tool surface, so a caller asking
+   * for page 2 gets exactly that page (with `pageSize` defaulting to 100).
+   */
+  async getBillingStatements(filter: BillingStatementFilter): Promise<any[]> {
     const params = new URLSearchParams();
-    params.append('organizationId', filter.organizationId.toString());
-    
-    if (filter.invoiceProfileId) params.append('invoiceProfileId', filter.invoiceProfileId.toString());
-    if (filter.provisionType) params.append('provisionType', filter.provisionType);
-    if (filter.from) params.append('from', filter.from);
-    if (filter.to) params.append('to', filter.to);
-    if (filter.page) params.append('page', filter.page.toString());
-    if (filter.pageSize) params.append('pageSize', filter.pageSize.toString());
+    params.append('OrganizationId', filter.organizationId.toString());
+    params.append('Page', (filter.page ?? 1).toString());
+    params.append('PageSize', (filter.pageSize ?? 100).toString());
 
-    const response = await this.apiClient.get(`/billingstatements/?${params.toString()}`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    });
+    if (filter.invoiceProfileId) params.append('InvoiceProfileId', filter.invoiceProfileId.toString());
+    if (filter.provisionType) params.append('ProvisionType', filter.provisionType);
+    if (filter.from) params.append('From', filter.from);
+    if (filter.to) params.append('To', filter.to);
 
-    return response.data;
+    return unwrapList(await this.get(`/BillingStatements?${params.toString()}`));
   }
 
   /**
-   * Get grouped billing statements
+   * Get grouped billing statements.
+   * Spec: GET /api/v1/BillingStatements/grouped -> GroupedBillingStatement[]
+   * Walks all pages: aggregates must never read a truncated result set.
    */
-  async getGroupedBillingStatements(filter: BillingStatementFilter): Promise<any> {
-    const token = await this.authenticate();
-    
-    const params = new URLSearchParams();
-    params.append('organizationId', filter.organizationId.toString());
-    
-    if (filter.invoiceProfileId) params.append('invoiceProfileId', filter.invoiceProfileId.toString());
-    if (filter.provisionType) params.append('provisionType', filter.provisionType);
-    if (filter.from) params.append('from', filter.from);
-    if (filter.to) params.append('to', filter.to);
+  async getGroupedBillingStatements(filter: BillingStatementFilter): Promise<any[]> {
+    const pageSize = 500;
+    return this.getAllPages((page) => {
+      const params = new URLSearchParams();
+      params.append('OrganizationId', filter.organizationId.toString());
+      params.append('Page', page.toString());
+      params.append('PageSize', pageSize.toString());
 
-    const response = await this.apiClient.get(`/billingstatements/grouped?${params.toString()}`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
+      if (filter.invoiceProfileId) params.append('InvoiceProfileId', filter.invoiceProfileId.toString());
+      if (filter.provisionType) params.append('ProvisionType', filter.provisionType);
+      if (filter.from) params.append('From', filter.from);
+      if (filter.to) params.append('To', filter.to);
+
+      return `/BillingStatements/grouped?${params.toString()}`;
     });
-
-    return response.data;
   }
 
   /**
-   * Get Azure usage data
+   * Get invoices for an organization.
+   * Spec: GET /api/v1/Invoices/{organizationId} (query: Page, PageSize) -> Invoice[]
+   * Note: the organization is a **path** segment, not a query parameter.
    */
-  async getAzureUsage(params: AzureUsageParams): Promise<any> {
-    const token = await this.authenticate();
-    
-    const queryParams = new URLSearchParams({
-      year: params.year.toString(),
-      month: params.month.toString(),
-    });
+  async getInvoices(organizationId: number, page?: number, pageSize?: number): Promise<any[]> {
+    const params = new URLSearchParams();
+    if (page) params.append('Page', page.toString());
+    if (pageSize) params.append('PageSize', pageSize.toString());
+    const qs = params.toString();
 
-    if (params.includeBom !== undefined) {
-      queryParams.append('includeBom', params.includeBom ? '1' : '0');
+    return unwrapList(await this.get(`/Invoices/${organizationId}${qs ? `?${qs}` : ''}`));
+  }
+
+  /**
+   * Get invoice profiles.
+   * Spec: GET /api/v1/InvoiceProfiles (query: OrganizationId) -> InvoiceProfileExtended[]
+   */
+  async getInvoiceProfiles(organizationId: number): Promise<any[]> {
+    const params = new URLSearchParams({ OrganizationId: organizationId.toString() });
+    return unwrapList(await this.get(`/InvoiceProfiles?${params.toString()}`));
+  }
+
+  /**
+   * Get organizations.
+   * Spec: GET /api/v1/Organizations (query: Page, PageSize, Search) -> Organization[]
+   */
+  async getOrganizations(): Promise<any[]> {
+    return unwrapList(await this.get('/Organizations'));
+  }
+
+  /**
+   * Get customer tenants (Azure/AWS customers).
+   * Spec: GET /api/v1/CustomerTenants -> CustomerTenantExtended[]
+   */
+  async getCustomerTenants(organizationId?: number): Promise<any[]> {
+    const params = new URLSearchParams();
+    if (organizationId) params.append('OrganizationId', organizationId.toString());
+    const qs = params.toString();
+
+    return unwrapList(await this.get(`/CustomerTenants${qs ? `?${qs}` : ''}`));
+  }
+
+  /**
+   * Get Azure subscriptions for a customer tenant.
+   *
+   * The customer-tenant -> Azure-plan -> subscriptions chain is resolved in two
+   * calls by the API's own design; the plan lookup is cached so repeated calls
+   * (the Azure cost tools) do not re-fetch it.
+   */
+  async getAzureSubscriptions(customerTenantId: number): Promise<any[]> {
+    const azurePlan = await this.getAzurePlanForTenant(customerTenantId);
+    if (!azurePlan?.id) {
+      return [];
     }
 
-    const response = await this.apiClient.get(
-      `/AzureUsage/${params.azurePlanId}/azureSubscriptions/${params.subscriptionId}/monthlyUsage?${queryParams.toString()}`,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      }
-    );
-
-    return response.data;
+    return unwrapList(await this.get(`/AzurePlans/${azurePlan.id}/azureSubscriptions`));
   }
 
   /**
-   * Get invoices
+   * Resolves (and caches) the Azure Plan for a customer tenant.
+   * Spec: GET /api/v1/CustomerTenants/{customerTenantId}/azurePlan -> AzurePlan
    */
-  async getInvoices(organizationId: number, page?: number, pageSize?: number): Promise<any> {
-    const token = await this.authenticate();
-    
-    const params = new URLSearchParams();
-    params.append('organizationId', organizationId.toString());
-    if (page) params.append('page', page.toString());
-    if (pageSize) params.append('pageSize', pageSize.toString());
+  async getAzurePlanForTenant(customerTenantId: number): Promise<any | null> {
+    const cached = this.azurePlanByTenant.get(customerTenantId);
+    if (cached !== undefined) return cached;
 
-    const response = await this.apiClient.get(`/invoices/?${params.toString()}`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    });
-
-    return response.data;
-  }
-
-  /**
-   * Get invoice profiles
-   */
-  async getInvoiceProfiles(organizationId: number): Promise<any> {
-    const token = await this.authenticate();
-    
-    const response = await this.apiClient.get(`/invoiceprofiles/?organizationId=${organizationId}`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    });
-
-    return response.data;
-  }
-
-  /**
-   * Get organizations (for listing available orgs)
-   */
-  async getOrganizations(): Promise<any> {
-    const token = await this.authenticate();
-    
-    const response = await this.apiClient.get('/organizations/', {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    });
-
-    return response.data;
-  }
-
-  /**
-   * Get customer tenants (Azure/AWS customers)
-   */
-  async getCustomerTenants(organizationId?: number): Promise<any> {
-    const token = await this.authenticate();
-    
-    const params = organizationId ? `?organizationId=${organizationId}` : '';
-    const response = await this.apiClient.get(`/customertenants/${params}`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    });
-
-    return response.data;
-  }
-
-  /**
-   * Get Azure subscriptions for a customer tenant
-   * First fetches the Azure Plan ID, then gets the subscriptions
-   */
-  async getAzureSubscriptions(customerTenantId: number): Promise<any> {
-    const token = await this.authenticate();
-    
     try {
-      // Step 1: Get the Azure Plan for this customer tenant
-      const planResponse = await this.apiClient.get(
-        `/customertenants/${customerTenantId}/azurePlan/`,
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        }
-      );
-      
-      const azurePlan = planResponse.data;
-      if (!azurePlan || !azurePlan.Id) {
-        return {
-          Items: [],
-          TotalHits: 0,
-          message: `No Azure Plan found for customer tenant ${customerTenantId}`,
-        };
-      }
-
-      // Step 2: Get Azure subscriptions for this Azure Plan
-      const subscriptionsResponse = await this.apiClient.get(
-        `/AzurePlans/${azurePlan.Id}/azureSubscriptions/`,
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        }
-      );
-
-      return subscriptionsResponse.data;
+      const plan = await this.get(`/CustomerTenants/${customerTenantId}/azurePlan`);
+      const result = plan?.id ? plan : null;
+      this.azurePlanByTenant.set(customerTenantId, result);
+      return result;
     } catch (error) {
-      // If Azure Plan not found, return empty list instead of error
+      // A tenant without an Azure plan legitimately returns 404.
       if ((error as any).response?.status === 404) {
-        return {
-          Items: [],
-          TotalHits: 0,
-          message: `No Azure Plan found for customer tenant ${customerTenantId}`,
-        };
+        this.azurePlanByTenant.set(customerTenantId, null);
+        return null;
       }
       throw error;
     }
   }
 
   /**
-   * Get subscriptions (all cloud subscriptions)
+   * Get subscriptions (all cloud subscriptions).
+   * Spec: GET /api/v1/Subscriptions
+   *   (query: OrganizationId, CustomerTenantId, PublisherId, Statuses, Page,
+   *    PageSize, Search, …) -> SubscriptionExtended[]
+   * `SubscriptionExtended` already embeds `subscriptionTags`, so tag lookups do
+   * not need an extra request per subscription.
    */
-  async getSubscriptions(organizationId?: number, page?: number, pageSize?: number): Promise<any> {
-    const token = await this.authenticate();
-    
-    const params = new URLSearchParams();
-    if (organizationId) params.append('organizationId', organizationId.toString());
-    if (page) params.append('page', page.toString());
-    if (pageSize) params.append('pageSize', pageSize.toString());
+  async getSubscriptions(options: {
+    organizationId?: number;
+    customerTenantId?: number;
+    page?: number;
+    pageSize?: number;
+    search?: string;
+  } = {}): Promise<any[]> {
+    // Explicit page -> single request (caller asked for pagination control).
+    if (options.page) {
+      const params = new URLSearchParams();
+      if (options.organizationId) params.append('OrganizationId', options.organizationId.toString());
+      if (options.customerTenantId) params.append('CustomerTenantId', options.customerTenantId.toString());
+      params.append('Page', options.page.toString());
+      if (options.pageSize) params.append('PageSize', options.pageSize.toString());
+      if (options.search) params.append('Search', options.search);
 
-    const response = await this.apiClient.get(`/subscriptions/?${params.toString()}`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    });
+      return unwrapList(await this.get(`/Subscriptions?${params.toString()}`));
+    }
 
-    return response.data;
+    // No page requested -> the caller wants the complete set.
+    return this.getAllSubscriptions(options);
   }
 
   /**
-   * Get historical billing data for multiple months
+   * Walks every page of the subscription list. Aggregates must use this: a
+   * single un-paginated request truncates silently at the API's page size.
    */
-  async getHistoricalBilling(organizationId: number, monthsBack: number = 6, invoiceProfileId?: number): Promise<any> {
-    await this.authenticate();
-    
+  private async getAllSubscriptions(options: {
+    organizationId?: number;
+    customerTenantId?: number;
+    search?: string;
+  } = {}): Promise<any[]> {
+    const pageSize = 500;
+    return this.getAllPages((page) => {
+      const params = new URLSearchParams();
+      params.append('Page', page.toString());
+      params.append('PageSize', pageSize.toString());
+      if (options.organizationId) params.append('OrganizationId', options.organizationId.toString());
+      if (options.customerTenantId) params.append('CustomerTenantId', options.customerTenantId.toString());
+      if (options.search) params.append('Search', options.search);
+      return `/Subscriptions?${params.toString()}`;
+    });
+  }
+
+  /**
+   * Get historical billing data for multiple months.
+   * Returns a flat array of grouped billing statements, complete across pages.
+   */
+  async getHistoricalBilling(organizationId: number, monthsBack: number = 6, invoiceProfileId?: number): Promise<any[]> {
     const endDate = new Date();
     const startDate = new Date();
-    startDate.setMonth(startDate.getMonth() - monthsBack);
-    
-    // Set to first day of the month to capture complete billing periods
-    // Billing statements have StartDate/EndDate periods (e.g., 2025-08-01 to 2025-09-01)
-    // We need to start from the 1st of the month to include those billing periods
-    startDate.setDate(1);
-    startDate.setHours(0, 0, 0, 0);
+    // setMonth is local-time based; billing periods are UTC dates on the wire, so
+    // compute the start month in UTC to avoid a DST/day-boundary drift.
+    startDate.setUTCMonth(startDate.getUTCMonth() - monthsBack);
 
-    const filter = {
+    // Start at the 1st of the month so complete billing periods are included
+    // (statements are keyed on StartDate/EndDate, e.g. 2025-08-01..2025-09-01).
+    startDate.setUTCDate(1);
+    startDate.setUTCHours(0, 0, 0, 0);
+
+    return this.getGroupedBillingStatements({
       organizationId,
       invoiceProfileId,
       from: startDate.toISOString(),
       to: endDate.toISOString(),
-    };
-
-    return this.getGroupedBillingStatements(filter);
+    });
   }
 
   /**
-   * Get subscription details with tags
+   * Get subscription details.
+   * Spec: GET /api/v1/Subscriptions/{id} -> SubscriptionDetailed
+   *
+   * The path is capitalised to match the spec exactly. Routing through the shared
+   * `get()` helper (rather than calling axios directly) also means this method
+   * picks up the request timeout and token handling like every other call.
    */
   async getSubscriptionById(subscriptionId: number): Promise<any> {
-    const token = await this.authenticate();
-    
-    const response = await this.apiClient.get(`/subscriptions/${subscriptionId}`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    });
-
-    return response.data;
+    return this.get(`/Subscriptions/${subscriptionId}`);
   }
 
   /**
@@ -362,80 +509,160 @@ export class CrayonApiClient {
   }
 
   /**
-   * Get Azure subscriptions for an Azure Plan
+   * Get Azure subscriptions for an Azure Plan.
+   * Spec: GET /api/v1/AzurePlans/{azurePlanId}/azureSubscriptions
    */
-  async getAzurePlanSubscriptions(azurePlanId: number): Promise<any> {
-    const token = await this.authenticate();
-    
-    const response = await this.apiClient.get(`/AzurePlans/${azurePlanId}/azureSubscriptions/`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    });
-
-    return response.data;
+  async getAzurePlanSubscriptions(azurePlanId: number): Promise<any[]> {
+    return unwrapList(await this.get(`/AzurePlans/${azurePlanId}/azureSubscriptions`));
   }
 
   /**
-   * Get subscription tags
+   * Get subscription tags.
+   * Spec: GET /api/v1/Subscriptions/{subscriptionId}/tags -> SubscriptionTags
    */
   async getSubscriptionTags(subscriptionId: number): Promise<any> {
-    const token = await this.authenticate();
-    
-    const response = await this.apiClient.get(`/subscriptions/${subscriptionId}/tags`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    });
-
-    return response.data;
+    return this.get(`/Subscriptions/${subscriptionId}/tags`);
   }
 
   /**
-   * Update subscription tags
+   * Replace the tags on a subscription.
+   *
+   * Spec: POST (not PUT) /api/v1/Subscriptions/{subscriptionId}/tags, body
+   * `SubscriptionTags` = `{ subscriptionId, costCenter, department, project,
+   * custom, owner }`. The endpoint is a whole-object replace, so unknown keys are
+   * rejected — arbitrary key/value maps are not accepted.
+   *
+   * @returns `true` when the API accepted the update.
    */
-  async updateSubscriptionTags(subscriptionId: number, tags: Record<string, string>): Promise<any> {
-    const token = await this.authenticate();
-    
-    const response = await this.apiClient.put(
-      `/subscriptions/${subscriptionId}/tags`,
-      tags,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      }
-    );
+  async updateSubscriptionTags(
+    subscriptionId: number,
+    tags: { costCenter?: string; department?: string; project?: string; custom?: string; owner?: string }
+  ): Promise<boolean> {
+    const body = {
+      subscriptionId,
+      costCenter: tags.costCenter ?? null,
+      department: tags.department ?? null,
+      project: tags.project ?? null,
+      custom: tags.custom ?? null,
+      owner: tags.owner ?? null,
+    };
 
-    return response.data;
+    return Boolean(await this.post(`/Subscriptions/${subscriptionId}/tags`, body));
   }
 
   /**
-   * Get cost tracking by subscription tags
+   * Get AWS accounts (the AWS equivalent of an Azure subscription).
+   * Spec: GET /api/v1/AwsAccounts
+   *   (query: OrganizationId, PublisherId, ConsumerId, CustomerTenantType,
+   *    Page, PageSize, Search) -> AwsAccountExtended[]
+   * `tags` is embedded, so no extra request is needed per account.
+   */
+  async getAwsAccounts(options: {
+    organizationId?: number;
+    customerTenantId?: number;
+    page?: number;
+    pageSize?: number;
+    search?: string;
+  } = {}): Promise<any[]> {
+    // Explicit page -> single request; otherwise walk all pages.
+    if (options.page) {
+      const params = new URLSearchParams();
+      if (options.organizationId) params.append('OrganizationId', options.organizationId.toString());
+      if (options.customerTenantId) params.append('ConsumerId', options.customerTenantId.toString());
+      params.append('Page', options.page.toString());
+      if (options.pageSize) params.append('PageSize', options.pageSize.toString());
+      if (options.search) params.append('Search', options.search);
+
+      return unwrapList(await this.get(`/AwsAccounts?${params.toString()}`));
+    }
+
+    const pageSize = 500;
+    return this.getAllPages((page) => {
+      const params = new URLSearchParams();
+      params.append('Page', page.toString());
+      params.append('PageSize', pageSize.toString());
+      if (options.organizationId) params.append('OrganizationId', options.organizationId.toString());
+      if (options.customerTenantId) params.append('ConsumerId', options.customerTenantId.toString());
+      if (options.search) params.append('Search', options.search);
+      return `/AwsAccounts?${params.toString()}`;
+    });
+  }
+
+  /**
+   * Get a single AWS account with its tags.
+   * Spec: GET /api/v1/AwsAccounts/{id} -> AwsAccountExtended
+   */
+  async getAwsAccountById(accountId: number): Promise<any> {
+    return this.get(`/AwsAccounts/${accountId}`);
+  }
+
+  /**
+   * Summarise spend per cloud provider for the subscription list.
+   *
+   * The same subscription catalogue covers every cloud Crayon resells
+   * (Microsoft/Azure, AWS, and others), so provider attribution is derived from
+   * the publisher already present on each subscription rather than maintained as
+   * separate per-cloud tools.
+   */
+  /**
+   * Get AWS accounts for the multi-cloud roll-up (complete across pages).
+   */
+  async getCloudSpendByPublisher(organizationId: number): Promise<any> {
+    const [subscriptions, awsAccounts] = await Promise.all([
+      this.getSubscriptions({ organizationId }),
+      this.getAwsAccounts({ organizationId }),
+    ]);
+
+    const byPublisher = new Map<string, { total: number; subscriptionCount: number }>();
+    for (const sub of subscriptions) {
+      const publisher = sub?.publisher?.name ?? 'Unknown';
+      const entry = byPublisher.get(publisher) ?? { total: 0, subscriptionCount: 0 };
+      entry.total += priceValue(sub?.salesPrice);
+      entry.subscriptionCount += 1;
+      byPublisher.set(publisher, entry);
+    }
+
+    return {
+      organizationId,
+      currencyCode: subscriptions.length ? priceCurrency(subscriptions[0]?.salesPrice) : 'NOK',
+      publishers: [...byPublisher.entries()]
+        .map(([publisher, data]) => ({ publisher, ...data }))
+        .sort((a, b) => b.total - a.total),
+      aws: {
+        accountCount: awsAccounts.length,
+        activatedAccounts: awsAccounts.filter((a) => a?.isActivated).length,
+        accounts: awsAccounts.map((a) => ({
+          id: a?.id,
+          name: a?.name ?? a?.awsAccountName ?? null,
+          payerAccountId: a?.payerAccountId ?? null,
+          masterAccountStatus: a?.masterAccountStatus ?? null,
+          awsSegment: a?.awsSegment ?? null,
+          isActivated: a?.isActivated ?? null,
+          tags: a?.tags ?? {},
+        })),
+      },
+    };
+  }
+
+  /**
+   * Get subscriptions together with their embedded tags and cost history.
+   *
+   * `SubscriptionExtended` already carries `subscriptionTags`, so no per-row
+   * tag request is needed (the previous implementation issued one request per
+   * subscription).
    */
   async getCostByTags(organizationId: number, monthsBack: number = 3): Promise<any> {
-    await this.authenticate();
-    
-    // Get subscriptions and billing data
     const [subscriptions, billingData] = await Promise.all([
-      this.getSubscriptions(organizationId),
+      this.getSubscriptions({ organizationId }),
       this.getHistoricalBilling(organizationId, monthsBack),
     ]);
 
-    // Fetch tags for each subscription
-    const subscriptionsWithTags = await Promise.all(
-      (subscriptions.Items || []).map(async (sub: any) => {
-        try {
-          const tags = await this.getSubscriptionTags(sub.Id);
-          return { ...sub, tags };
-        } catch (error) {
-          return { ...sub, tags: null };
-        }
-      })
-    );
-
     return {
-      subscriptions: subscriptionsWithTags,
+      subscriptions: subscriptions.map((sub) => ({
+        id: sub?.id,
+        name: sub?.name,
+        tags: sub?.subscriptionTags ?? null,
+      })),
       billingData,
       organizationId,
       monthsBack,
@@ -443,106 +670,91 @@ export class CrayonApiClient {
   }
 
   /**
-   * Get total Azure costs for a date range
+   * Get total Azure costs for an organization within a date range.
+   * Spec: GET /api/v1/UsageCost/organization/{organizationId}?from&to
+   *       -> OrganizationUsageCost[]
    */
   async getAzureCostsByDateRange(organizationId: number, from: string, to: string): Promise<any> {
-    const token = await this.authenticate();
-    
-    try {
-      // Try organization-level endpoint first
-      const response = await this.apiClient.get(
-        `/usagecost/organization/${organizationId}/?from=${from}&to=${to}`,
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        }
-      );
+    const params = new URLSearchParams({ from, to });
+    const items = unwrapList(await this.get(`/UsageCost/organization/${organizationId}?${params.toString()}`));
 
-      return response.data;
-    } catch (error) {
-      // Fallback: aggregate billing statements
-      logger.error('Organization-level cost endpoint failed, using billing statements fallback');
-      const billingData = await this.getGroupedBillingStatements({
-        organizationId,
-        from,
-        to,
-      });
-
-      return {
-        organizationId,
-        from,
-        to,
-        billingStatements: billingData,
-        source: 'billing_statements_fallback',
-      };
-    }
+    return {
+      organizationId,
+      from,
+      to,
+      totalCost: items.reduce((sum, item) => sum + priceValue(item?.amount), 0),
+      currencyCode: items.length ? (items[0]?.currencyCode ?? 'NOK') : 'NOK',
+      itemCount: items.length,
+      items,
+    };
   }
 
   /**
-   * Get Azure costs by subscription for a date range
+   * Get Azure costs for a subscription within a date range, by category.
+   * Spec: POST /api/v1/UsageCost/getForCategory
+   *       body { resellerCustomerId, subscriptionId, category, currencyCode, from, to }
+   *       -> CategoryUsageCost[] = [{ subcategory, amount, currencyCode }]
    */
   async getAzureCostsBySubscription(azurePlanId: number, subscriptionId: number, from: string, to: string): Promise<any> {
-    const token = await this.authenticate();
-    
-    try {
-      const response = await this.apiClient.get(
-        `/usagecost/resellerCustomer/${azurePlanId}/subscription/${subscriptionId}/category/azure/?from=${from}&to=${to}`,
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        }
-      );
+    const items = unwrapList(
+      await this.post('/UsageCost/getForCategory', {
+        resellerCustomerId: azurePlanId,
+        subscriptionId: String(subscriptionId),
+        category: 'azure',
+        from,
+        to,
+      })
+    );
 
-      return response.data;
-    } catch (error) {
-      // Fallback: try to get Azure usage CSV
-      logger.error('Subscription-level cost endpoint failed, using fallback');
-      
-      const fromDate = new Date(from);
-      const year = fromDate.getFullYear();
-      const month = fromDate.getMonth() + 1;
+    return {
+      azurePlanId,
+      subscriptionId,
+      from,
+      to,
+      totalCost: items.reduce((sum, item) => sum + priceValue(item?.amount), 0),
+      currencyCode: items.length ? (items[0]?.currencyCode ?? 'NOK') : 'NOK',
+      itemCount: items.length,
+      items,
+    };
+  }
 
-      try {
-        const usageData = await this.getAzureUsage({ azurePlanId, subscriptionId, year, month });
-        return {
-          azurePlanId,
-          subscriptionId,
-          from,
-          to,
-          usageData,
-          source: 'usage_csv_fallback',
-        };
-      } catch (usageError) {
-        throw new Error(`Failed to fetch costs: ${usageError instanceof Error ? usageError.message : 'Unknown error'}`);
-      }
+  /**
+   * Get Azure usage for a subscription as a downloadable CSV reference.
+   * Spec: GET /api/v1/AzureUsage/{azurePlanId}/azureSubscriptions/{id}/monthlyUsage
+   *       (query: year, month, includeBom) -> AzureUsageFile
+   */
+  async getAzureUsage(params: AzureUsageParams): Promise<any> {
+    const query = new URLSearchParams({
+      year: params.year.toString(),
+      month: params.month.toString(),
+    });
+    if (params.includeBom !== undefined) {
+      query.append('includeBom', params.includeBom ? 'true' : 'false');
     }
+
+    return this.get(
+      `/AzureUsage/${params.azurePlanId}/azureSubscriptions/${params.subscriptionId}/monthlyUsage?${query.toString()}`
+    );
   }
 
   /**
    * Get cost trends over multiple months
    */
   async getCostTrends(organizationId: number, monthsBack: number = 6): Promise<any> {
-    await this.authenticate();
-    
     const historicalData = await this.getHistoricalBilling(organizationId, monthsBack);
     const costsByMonth: { [key: string]: number } = {};
-    
-    // Aggregate costs by month
-    if (historicalData.Items) {
-      historicalData.Items.forEach((item: any) => {
-        // Extract month from StartDate (format: 2025-10-01T00:00:00+00:00)
-        const startDate = item.StartDate ? new Date(item.StartDate) : null;
-        const month = startDate 
-          ? `${startDate.getFullYear()}-${String(startDate.getMonth() + 1).padStart(2, '0')}` 
-          : 'unknown';
-        
-        // Extract numeric value from TotalSalesPrice object
-        const cost = item.TotalSalesPrice?.Value || 0;
-        costsByMonth[month] = (costsByMonth[month] || 0) + cost;
-      });
-    }
+
+    // Aggregate costs by month. `startDate` is ISO (e.g. 2025-10-01T00:00:00+00:00)
+    // and `totalSalesPrice` is a Price object, so both go through the helpers.
+    historicalData.forEach((item: any) => {
+      const startDate = item?.startDate ? new Date(item.startDate) : null;
+      const month = startDate && !isNaN(startDate.getTime())
+        ? `${startDate.getUTCFullYear()}-${String(startDate.getUTCMonth() + 1).padStart(2, '0')}`
+        : 'unknown';
+
+      const cost = priceValue(item?.totalSalesPrice);
+      costsByMonth[month] = (costsByMonth[month] || 0) + cost;
+    });
 
     // Calculate month-over-month changes
     const trends = Object.entries(costsByMonth)
@@ -582,52 +794,51 @@ export class CrayonApiClient {
    * Detect cost anomalies - find subscriptions with significant changes
    */
   async detectCostAnomalies(organizationId: number, monthsBack: number = 3, changeThresholdPercent: number = 25): Promise<any> {
-    await this.authenticate();
-    
     // Get subscriptions and their cost history
-    const subscriptions = await this.getSubscriptions(organizationId);
+    const subscriptions = await this.getSubscriptions({ organizationId });
     const billingData = await this.getHistoricalBilling(organizationId, monthsBack);
 
     const anomalies: any[] = [];
-    
+
     // Group billing data by subscription
     const costsBySubscription: { [key: string]: any[] } = {};
-    if (billingData.Items) {
-      billingData.Items.forEach((item: any) => {
-        const subId = item.SubscriptionId || 'unknown';
-        if (!costsBySubscription[subId]) costsBySubscription[subId] = [];
-        costsBySubscription[subId].push(item);
-      });
-    }
+    billingData.forEach((item: any) => {
+      const subId = item?.orderId || item?.invoiceProfile?.id || 'unknown';
+      if (!costsBySubscription[subId]) costsBySubscription[subId] = [];
+      costsBySubscription[subId].push(item);
+    });
 
     // Analyze trends for each subscription
     Object.entries(costsBySubscription).forEach(([subId, costs]) => {
-      const sortedCosts = costs.sort((a: any, b: any) => new Date(a.Date || 0).getTime() - new Date(b.Date || 0).getTime());
-      
+      const sortedCosts = [...costs].sort(
+        (a: any, b: any) => new Date(a.startDate || 0).getTime() - new Date(b.startDate || 0).getTime()
+      );
+
       for (let i = 1; i < sortedCosts.length; i++) {
-        const current = sortedCosts[i].TotalSalesPrice || 0;
-        const previous = sortedCosts[i - 1].TotalSalesPrice || 0;
-        
+        const current = priceValue(sortedCosts[i].totalSalesPrice);
+        const previous = priceValue(sortedCosts[i - 1].totalSalesPrice);
+
         if (previous > 0) {
           const changePercent = ((current - previous) / previous) * 100;
-          
+
           if (Math.abs(changePercent) > changeThresholdPercent) {
-            const sub = subscriptions.Items?.find((s: any) => s.Id.toString() === subId);
+            const sub = subscriptions.find((s: any) => String(s?.id) === String(subId));
             anomalies.push({
               subscriptionId: subId,
-              subscriptionName: sub?.Name || 'Unknown',
+              subscriptionName: sub?.name || 'Unknown',
               previousCost: previous,
               currentCost: current,
               change: current - previous,
               changePercent: parseFloat(changePercent.toFixed(2)),
-              date: sortedCosts[i].Date,
+              // `startDate` is the statement period key (camelCase in the API).
+              date: sortedCosts[i]?.startDate ?? null,
             });
           }
         }
       }
     });
 
-    // Sort by highest change
+    // Sort by highest change. `toSorted` avoids mutating the input array.
     anomalies.sort((a, b) => Math.abs(b.changePercent) - Math.abs(a.changePercent));
 
     return {
@@ -646,46 +857,34 @@ export class CrayonApiClient {
 
   /**
    * Analyze costs by tags (cost centers, departments, etc.)
+   *
+   * Tags come from `subscriptionTags` on the subscription list response, so this
+   * is two API calls regardless of subscription count (previously N+1).
    */
   async analyzeCostsByTags(organizationId: number, monthsBack: number = 3): Promise<any> {
-    await this.authenticate();
-    
-    // Get all subscriptions with their tags
-    const subscriptions = await this.getSubscriptions(organizationId);
+    const subscriptions = await this.getSubscriptions({ organizationId });
     const billingData = await this.getHistoricalBilling(organizationId, monthsBack);
 
-    // Fetch tags for each subscription
-    const subscriptionsWithTags = await Promise.all(
-      (subscriptions.Items || []).map(async (sub: any) => {
-        try {
-          const tags = await this.getSubscriptionTags(sub.Id);
-          return { ...sub, tags: tags || {} };
-        } catch (error) {
-          return { ...sub, tags: {} };
-        }
-      })
+    // Grouped billing statements are keyed by invoice profile, not subscription,
+    // so tag attribution uses each subscription's own sales price.
+    const subIdToTags = new Map<number, any>(
+      subscriptions.map((s: any) => [s?.id, s?.subscriptionTags ?? {}])
     );
 
-    // Create subscription ID to tags mapping
-    const subIdToTags = new Map(subscriptionsWithTags.map((s: any) => [s.Id, s.tags]));
-
-    // Aggregate costs by tag
     const costsByTag: { [key: string]: { [key: string]: number } } = {};
-    
-    if (billingData.Items) {
-      billingData.Items.forEach((item: any) => {
-        const subId = item.SubscriptionId;
-        const cost = item.TotalSalesPrice || 0;
-        const tags = subIdToTags.get(subId) || {};
 
-        // Aggregate by each tag key-value pair
-        Object.entries(tags).forEach(([tagKey, tagValue]: [string, any]) => {
-          if (!costsByTag[tagKey]) costsByTag[tagKey] = {};
-          const tagVal = String(tagValue);
-          costsByTag[tagKey][tagVal] = (costsByTag[tagKey][tagVal] || 0) + cost;
-        });
-      });
-    }
+    subscriptions.forEach((sub: any) => {
+      const tags = subIdToTags.get(sub.id) ?? {};
+      const cost = priceValue(sub.salesPrice);
+
+      // Only the named tag dimensions are meaningful for aggregation.
+      for (const [tagKey, tagValue] of Object.entries(tags)) {
+        if (tagValue === null || tagValue === undefined || tagValue === '') continue;
+        if (!costsByTag[tagKey]) costsByTag[tagKey] = {};
+        const tagVal = String(tagValue);
+        costsByTag[tagKey][tagVal] = (costsByTag[tagKey][tagVal] || 0) + cost;
+      }
+    });
 
     // Format results
     const costBreakdown = Object.entries(costsByTag).map(([tagKey, values]) => ({
@@ -699,46 +898,47 @@ export class CrayonApiClient {
     return {
       organizationId,
       monthsBack,
-      subscriptionsAnalyzed: subscriptionsWithTags.length,
+      subscriptionsAnalyzed: subscriptions.length,
+      billingStatementsAnalyzed: billingData.length,
       costBreakdown,
     };
   }
 
   /**
-   * Find subscriptions by name pattern and get their latest invoice
+   * Find subscriptions by name pattern and get their latest invoice.
+   *
+   * Invoices are fetched once and joined in memory; tags are read from the
+   * embedded `subscriptionTags` rather than per-subscription requests.
    */
   async findSimilarSubscriptionsAndInvoices(organizationId: number, namePattern: string): Promise<any> {
-    await this.authenticate();
-    
-    // Get all subscriptions
-    const subscriptions = await this.getSubscriptions(organizationId);
-    
-    // Filter by name pattern (case-insensitive regex)
+    const subscriptions = await this.getSubscriptions({ organizationId });
+
     const pattern = new RegExp(namePattern, 'i');
-    const matchingSubscriptions = (subscriptions.Items || []).filter((sub: any) => 
-      pattern.test(sub.Name || '')
+    const matchingSubscriptions = subscriptions.filter((sub: any) =>
+      pattern.test(sub?.name ?? '')
     );
 
-    // Get invoices for matching subscriptions
+    // Invoices are per organization, not per subscription.
     const invoices = await this.getInvoices(organizationId);
-    
-    const subscriptionsWithInvoices = await Promise.all(
-      matchingSubscriptions.map(async (sub: any) => {
-        const subInvoices = (invoices.Items || []).filter((inv: any) => 
-          inv.SubscriptionId === sub.Id
-        ).sort((a: any, b: any) => new Date(b.Date || 0).getTime() - new Date(a.Date || 0).getTime());
 
-        const tags = await this.getSubscriptionTags(sub.Id).catch(() => ({}));
+    const subscriptionsWithInvoices = matchingSubscriptions.map((sub: any) => {
+      const subInvoices = invoices
+        .filter((inv: any) => inv?.orderId && sub?.orderId && inv.orderId === sub.orderId)
+        .sort((a: any, b: any) => new Date(b.invoiceDate || 0).getTime() - new Date(a.invoiceDate || 0).getTime());
 
-        return {
-          subscription: sub,
-          tags,
-          lastInvoice: subInvoices[0] || null,
-          totalInvoices: subInvoices.length,
-          recentInvoices: subInvoices.slice(0, 5),
-        };
-      })
-    );
+      return {
+        subscription: {
+          id: sub?.id,
+          name: sub?.name,
+          status: sub?.status,
+          salesPrice: priceValue(sub?.salesPrice),
+        },
+        tags: sub?.subscriptionTags ?? {},
+        lastInvoice: subInvoices[0] ?? null,
+        totalInvoices: subInvoices.length,
+        recentInvoices: subInvoices.slice(0, 5),
+      };
+    });
 
     return {
       organizationId,
@@ -749,214 +949,157 @@ export class CrayonApiClient {
   }
 
   /**
-   * List all subscriptions with their tags for verification and auditing
+   * List all subscriptions with their tags for verification and auditing.
+   *
+   * Tags are embedded in the subscription list response (`subscriptionTags`), so
+   * this is a single paginated walk with no per-row requests.
    */
   async listAllSubscriptionsWithTags(organizationId?: number): Promise<any> {
-    await this.authenticate();
-    
-    // Get all subscriptions
-    const subscriptions = await this.getSubscriptions(organizationId);
-    
-    // Fetch tags for each subscription
-    const subscriptionsWithTags = await Promise.all(
-      (subscriptions.Items || []).map(async (sub: any) => {
-        try {
-          const tags = await this.getSubscriptionTags(sub.Id);
-          return {
-            id: sub.Id,
-            name: sub.Name,
-            status: sub.Status,
-            type: sub.Type,
-            createdDate: sub.CreatedDate,
-            tags: tags || {},
-          };
-        } catch (error) {
-          return {
-            id: sub.Id,
-            name: sub.Name,
-            status: sub.Status,
-            type: sub.Type,
-            createdDate: sub.CreatedDate,
-            tags: {},
-            tagsError: `Failed to fetch tags: ${error instanceof Error ? error.message : 'Unknown error'}`,
-          };
-        }
-      })
-    );
+    const subscriptions = await this.getSubscriptions({ organizationId });
+
+    const rows = subscriptions.map((sub: any) => ({
+      id: sub?.id,
+      name: sub?.name,
+      status: sub?.status,
+      publisher: sub?.publisher?.name ?? null,
+      organization: sub?.organization?.name ?? null,
+      startDate: sub?.startDate ?? null,
+      endDate: sub?.endDate ?? null,
+      salesPrice: priceValue(sub?.salesPrice),
+      tags: sub?.subscriptionTags ?? {},
+    }));
+
+    const untagged = rows.filter((r) => Object.keys(r.tags).length === 0).length;
 
     return {
-      organizationId: organizationId || 'all',
-      totalSubscriptions: subscriptionsWithTags.length,
-      subscriptions: subscriptionsWithTags,
+      organizationId: organizationId ?? 'all',
+      totalSubscriptions: rows.length,
+      untaggedSubscriptions: untagged,
+      subscriptions: rows,
     };
+  }
+
+  /**
+   * Resolves the previous calendar month as an inclusive date range.
+   * Computed in UTC: the API compares ISO date strings, and using local-time
+   * getters would shift the window on non-UTC hosts (e.g. a CET container) or on
+   * the month boundary.
+   */
+  private previousMonthRange(now = new Date()): { from: string; to: string } {
+    const lastMonthEnd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 0));
+    const lastMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+    return {
+      from: lastMonthStart.toISOString().split('T')[0],
+      to: lastMonthEnd.toISOString().split('T')[0],
+    };
+  }
+
+  /** Sums the `totalSalesPrice` (Price) of grouped billing statements. */
+  private sumBillingStatements(statements: any[]): { total: number; currency: string } {
+    const total = statements.reduce((sum, item) => sum + priceValue(item?.totalSalesPrice), 0);
+    const currency = statements.length ? priceCurrency(statements[0]?.totalSalesPrice) : 'NOK';
+    return { total, currency };
   }
 
   /**
    * Get last month costs summary by organization
    */
   async getLastMonthCostsByOrganization(organizationId: number): Promise<any> {
-    await this.authenticate();
-    
-    // Calculate last month's date range
-    const today = new Date();
-    const lastMonthEnd = new Date(today.getFullYear(), today.getMonth(), 0); // Last day of previous month
-    const lastMonthStart = new Date(today.getFullYear(), today.getMonth() - 1, 1);
-    
-    const from = lastMonthStart.toISOString().split('T')[0];
-    const to = lastMonthEnd.toISOString().split('T')[0];
+    const { from, to } = this.previousMonthRange();
 
-    try {
-      const billingData = await this.getGroupedBillingStatements({
-        organizationId,
-        from,
-        to,
-      });
-
-      const totalCost = (billingData.Items || []).reduce((sum: number, item: any) => 
-        sum + (item.TotalSalesPrice || 0), 0
-      );
-
-      return {
-        organizationId,
-        period: { from, to, description: 'Last Month' },
-        totalCost,
-        currencyCode: (billingData.Items && billingData.Items[0]?.CurrencyCode) || 'USD',
-        itemsCount: billingData.Items?.length || 0,
-        items: billingData.Items || [],
-      };
-    } catch (error) {
-      throw new Error(`Failed to get last month costs: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-  }
-
-  /**
-   * Get last month costs breakdown by invoice profile
-   */
-  async getLastMonthCostsByInvoiceProfile(organizationId: number): Promise<any> {
-    await this.authenticate();
-    
-    // Get invoice profiles
-    const profiles = await this.getInvoiceProfiles(organizationId);
-    
-    // Calculate last month's date range
-    const today = new Date();
-    const lastMonthEnd = new Date(today.getFullYear(), today.getMonth(), 0);
-    const lastMonthStart = new Date(today.getFullYear(), today.getMonth() - 1, 1);
-    
-    const from = lastMonthStart.toISOString().split('T')[0];
-    const to = lastMonthEnd.toISOString().split('T')[0];
-
-    // Get costs for each invoice profile
-    const costsByProfile = await Promise.all(
-      (profiles.Items || []).map(async (profile: any) => {
-        try {
-          const billingData = await this.getGroupedBillingStatements({
-            organizationId,
-            invoiceProfileId: profile.Id,
-            from,
-            to,
-          });
-
-          const totalCost = (billingData.Items || []).reduce((sum: number, item: any) => 
-            sum + (item.TotalSalesPrice || 0), 0
-          );
-
-          return {
-            profileId: profile.Id,
-            profileName: profile.Name,
-            totalCost,
-            currencyCode: (billingData.Items && billingData.Items[0]?.CurrencyCode) || 'USD',
-            itemsCount: billingData.Items?.length || 0,
-          };
-        } catch (error) {
-          return {
-            profileId: profile.Id,
-            profileName: profile.Name,
-            totalCost: 0,
-            error: `Failed to fetch costs: ${error instanceof Error ? error.message : 'Unknown error'}`,
-          };
-        }
-      })
-    );
-
-    const totalOrganizationCost = costsByProfile.reduce((sum: number, p: any) => 
-      sum + (p.totalCost || 0), 0
-    );
+    const billingData = await this.getGroupedBillingStatements({ organizationId, from, to });
+    const { total, currency } = this.sumBillingStatements(billingData);
 
     return {
       organizationId,
       period: { from, to, description: 'Last Month' },
-      totalOrganizationCost,
-      profilesCount: costsByProfile.length,
-      costsByProfile: costsByProfile.sort((a: any, b: any) => 
-        (b.totalCost || 0) - (a.totalCost || 0)
-      ),
+      totalCost: total,
+      currencyCode: currency,
+      itemsCount: billingData.length,
+      items: billingData,
     };
   }
 
   /**
-   * Get last month costs breakdown by tags (CostCenter, Department, etc.)
+   * Get last month costs breakdown by invoice profile.
+   *
+   * A single grouped-billing call already carries the invoice profile per row, so
+   * this needs two requests total (profiles + statements) instead of one request
+   * per profile.
+   */
+  async getLastMonthCostsByInvoiceProfile(organizationId: number): Promise<any> {
+    const { from, to } = this.previousMonthRange();
+
+    const [profiles, billingData] = await Promise.all([
+      this.getInvoiceProfiles(organizationId),
+      this.getGroupedBillingStatements({ organizationId, from, to }),
+    ]);
+
+    // Accumulate per profile from the single statement result set.
+    const totalsByProfile = new Map<number, { total: number; items: number; currency: string }>();
+    for (const statement of billingData) {
+      const profileId = statement?.invoiceProfile?.id;
+      if (profileId === undefined || profileId === null) continue;
+
+      const entry = totalsByProfile.get(profileId) ?? { total: 0, items: 0, currency: priceCurrency(statement?.totalSalesPrice) };
+      entry.total += priceValue(statement?.totalSalesPrice);
+      entry.items += 1;
+      totalsByProfile.set(profileId, entry);
+    }
+
+    const costsByProfile = profiles.map((profile: any) => {
+      const entry = totalsByProfile.get(profile?.id);
+      return {
+        profileId: profile?.id,
+        profileName: profile?.name,
+        totalCost: entry?.total ?? 0,
+        currencyCode: entry?.currency ?? 'NOK',
+        itemsCount: entry?.items ?? 0,
+      };
+    }).sort((a: any, b: any) => b.totalCost - a.totalCost);
+
+    return {
+      organizationId,
+      period: { from, to, description: 'Last Month' },
+      totalOrganizationCost: costsByProfile.reduce((sum: number, p: any) => sum + p.totalCost, 0),
+      profilesCount: costsByProfile.length,
+      costsByProfile,
+    };
+  }
+
+  /**
+   * Get last month costs breakdown by tags (costCenter, department, project,
+   * custom, owner).
+   *
+   * Tag dimensions come from the subscription list (embedded `subscriptionTags`)
+   * and each subscription's own `salesPrice`, so this is two API calls total.
    */
   async getLastMonthCostsByTags(organizationId: number): Promise<any> {
-    await this.authenticate();
-    
-    // Get all subscriptions with tags
-    const subscriptions = await this.getSubscriptions(organizationId);
-    
-    // Fetch tags for all subscriptions
-    const subscriptionsWithTags = await Promise.all(
-      (subscriptions.Items || []).map(async (sub: any) => {
-        try {
-          const tags = await this.getSubscriptionTags(sub.Id);
-          return { id: sub.Id, name: sub.Name, tags: tags || {} };
-        } catch (error) {
-          return { id: sub.Id, name: sub.Name, tags: {} };
-        }
-      })
-    );
+    const { from, to } = this.previousMonthRange();
 
-    // Calculate last month's date range
-    const today = new Date();
-    const lastMonthEnd = new Date(today.getFullYear(), today.getMonth(), 0);
-    const lastMonthStart = new Date(today.getFullYear(), today.getMonth() - 1, 1);
-    
-    const from = lastMonthStart.toISOString().split('T')[0];
-    const to = lastMonthEnd.toISOString().split('T')[0];
+    // Only the subscription list is needed: it carries both tags and sales price.
+    const subscriptions = await this.getSubscriptions({ organizationId });
 
-    // Get billing data
-    const billingData = await this.getGroupedBillingStatements({
-      organizationId,
-      from,
-      to,
-    });
-
-    // Create subscription ID to tags mapping
-    const subIdToTags = new Map(subscriptionsWithTags.map(s => [s.id, s.tags]));
-    const subIdToName = new Map(subscriptionsWithTags.map(s => [s.id, s.name]));
-
-    // Aggregate costs by tag
     const costsByTag: { [key: string]: { [key: string]: { cost: number; subscriptions: string[] } } } = {};
-    
-    if (billingData.Items) {
-      billingData.Items.forEach((item: any) => {
-        const subId = item.SubscriptionId;
-        const cost = item.TotalSalesPrice || 0;
-        const tags = subIdToTags.get(subId) || {};
-        const subName = subIdToName.get(subId) || `Unknown (${subId})`;
 
-        // Aggregate by each tag key-value pair
-        Object.entries(tags).forEach(([tagKey, tagValue]: [string, any]) => {
-          if (!costsByTag[tagKey]) costsByTag[tagKey] = {};
-          const tagVal = String(tagValue);
-          if (!costsByTag[tagKey][tagVal]) {
-            costsByTag[tagKey][tagVal] = { cost: 0, subscriptions: [] };
-          }
-          costsByTag[tagKey][tagVal].cost += cost;
-          if (!costsByTag[tagKey][tagVal].subscriptions.includes(subName)) {
-            costsByTag[tagKey][tagVal].subscriptions.push(subName);
-          }
-        });
-      });
+    for (const sub of subscriptions) {
+      const tags = sub?.subscriptionTags ?? {};
+      const cost = priceValue(sub?.salesPrice);
+      const subName = sub?.name ?? `Unknown (${sub?.id})`;
+
+      for (const [tagKey, tagValue] of Object.entries(tags)) {
+        if (tagValue === null || tagValue === undefined || tagValue === '') continue;
+        if (!costsByTag[tagKey]) costsByTag[tagKey] = {};
+        const tagVal = String(tagValue);
+
+        if (!costsByTag[tagKey][tagVal]) {
+          costsByTag[tagKey][tagVal] = { cost: 0, subscriptions: [] };
+        }
+        costsByTag[tagKey][tagVal].cost += cost;
+        if (!costsByTag[tagKey][tagVal].subscriptions.includes(subName)) {
+          costsByTag[tagKey][tagVal].subscriptions.push(subName);
+        }
+      }
     }
 
     // Format results
@@ -970,21 +1113,17 @@ export class CrayonApiClient {
         }))
         .sort((a: any, b: any) => b.cost - a.cost);
 
-      const total = breakdown.reduce((sum: number, b: any) => sum + b.cost, 0);
-
       return {
         tag: tagKey,
-        total,
+        total: breakdown.reduce((sum: number, b: any) => sum + b.cost, 0),
         breakdown,
       };
     }).sort((a: any, b: any) => b.total - a.total);
 
-    const totalCost = costBreakdown.reduce((sum: number, t: any) => sum + t.total, 0);
-
     return {
       organizationId,
       period: { from, to, description: 'Last Month' },
-      totalCost,
+      totalCost: costBreakdown.reduce((sum: number, t: any) => sum + t.total, 0),
       tagsCount: costBreakdown.length,
       costByTags: costBreakdown,
     };

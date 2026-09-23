@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: crayon-cost-mcp:local
     container_name: crayon-cost-mcp
     ports:
       - "3003:3003"
@@ -10,14 +11,28 @@ services:
       - .env
     environment:
       - NODE_ENV=production
-      - TRANSPORT_MODE=http
-    restart: unless-stopped
+      - HOST=0.0.0.0
+      - PORT=3003
+    # Mirrors the Azure Container Apps startup/liveness probes so local and
+    # deployed behaviour match. ACA ignores Dockerfile HEALTHCHECK.
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3003/health"]
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3003/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
       interval: 30s
-      timeout: 10s
+      timeout: 5s
       retries: 3
-      start_period: 40s
+      start_period: 20s
+    # The image already runs as uid 1001; read_only is safe because the only
+    # writable path (log file) is opt-in via LOG_TO_FILE and /tmp is mounted.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
     networks:
       - mcp-network
 

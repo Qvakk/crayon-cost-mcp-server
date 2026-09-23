@@ -1,8 +1,15 @@
 import CircuitBreaker from 'opossum';
 import { logger } from './logger.js';
+import { resolveConfig, type AppConfig } from '../utils/config.js';
+
+/** Memoized so repeated wrapper creation still resolves configuration once. */
+const config: AppConfig = resolveConfig();
 
 /**
- * Wraps API calls with circuit breaker and timeout
+ * Wraps API calls with circuit breaker and timeout.
+ *
+ * Reads its thresholds from the validated `AppConfig` (not raw env) so the
+ * documented settings and the runtime behaviour cannot drift apart.
  */
 export function createCircuitBreakerWrapper(
   onCircuitOpen?: () => void
@@ -10,9 +17,9 @@ export function createCircuitBreakerWrapper(
   const breaker = new CircuitBreaker(
     async (fn: () => Promise<any>) => fn(),
     {
-      timeout: parseInt(process.env.API_TIMEOUT_MS || '30000'), // 30 seconds
-      errorThresholdPercentage: parseInt(process.env.CIRCUIT_BREAKER_THRESHOLD || '50'),
-      resetTimeout: parseInt(process.env.CIRCUIT_BREAKER_TIMEOUT_MS || '30000'),
+      timeout: config.apiTimeoutMs,
+      errorThresholdPercentage: config.circuitBreakerThreshold,
+      resetTimeout: config.circuitBreakerTimeoutMs,
       name: 'crayon-api',
       rollingCountBuckets: 10,
       rollingCountTimeout: 10000,
@@ -26,23 +33,15 @@ export function createCircuitBreakerWrapper(
     onCircuitOpen?.();
   });
 
-  breaker.on('halfOpen', () => {
-    // Only log at error level per requirements
-  });
-
-  breaker.on('close', () => {
-    // Only log at error level per requirements
-  });
-
-  breaker.on('fallback', (_result: any) => {
-    // Only log at error level per requirements
-  });
-
   return {
     /**
-     * Execute API call with circuit breaker protection
+     * Execute API call with circuit breaker protection.
+     *
+     * Failures propagate to the caller: returning fabricated "zero cost" data on
+     * a circuit-open condition would be worse than surfacing the error, so no
+     * fallback is offered.
      */
-    async execute<T>(apiCall: () => Promise<T>, fallback?: T): Promise<T> {
+    async execute<T>(apiCall: () => Promise<T>): Promise<T> {
       try {
         return await breaker.fire(async () => apiCall());
       } catch (error) {
@@ -50,10 +49,6 @@ export function createCircuitBreakerWrapper(
           error: error instanceof Error ? error.message : 'Unknown',
           circuitBreakerState: breaker.opened ? 'open' : 'closed',
         });
-
-        if (fallback !== undefined) {
-          return fallback;
-        }
 
         throw error;
       }
@@ -76,17 +71,14 @@ export function createCircuitBreakerWrapper(
 }
 
 /**
- * Sanitize error message to prevent information disclosure
+ * Maps a caught error to a generic, client-safe message.
+ *
+ * Pure mapping only: the caller is responsible for logging the failure (with the
+ * tool and caller context) before invoking this, so the error is recorded once
+ * with full context rather than twice with partial context.
  */
-export function sanitizeErrorMessage(error: any, toolName: string): string {
+export function sanitizeErrorMessage(error: any, _toolName: string): string {
   const message = error instanceof Error ? error.message : 'Unknown error';
-
-  // Log full error for debugging
-  logger.error('Tool execution error details', {
-    tool: toolName,
-    error: message,
-    stack: error instanceof Error ? error.stack : undefined,
-  });
 
   // Return generic message to client
   if (message.includes('token')) return 'Authentication error';
@@ -100,15 +92,3 @@ export function sanitizeErrorMessage(error: any, toolName: string): string {
 
   return 'An error occurred processing your request';
 }
-
-/**
- * List of expensive operations for monitoring
- */
-export const expensiveOperations = [
-  'get_azure_usage',          // Downloads CSV files
-  'get_billing_statements',   // Large data sets
-  'get_grouped_billing_statements',  // Large data sets
-  'get_historical_costs',     // Multiple months of data
-  'detect_cost_anomalies',    // Complex calculations
-  'analyze_costs_by_tags',    // Complex aggregations
-];

@@ -8,40 +8,54 @@ import { getCurrentLocale } from './localization.js';
 /**
  * Chart Generator Utility
  * Generates charts using Chart.js and returns them as base64 data URLs for embedding in chat
- * 
+ *
  * Note: Requires canvas dependencies. Works automatically in Docker.
  */
-export class ChartGenerator {
-  private chartJSNodeCanvas: ChartJSNodeCanvas;
+class ChartGenerator {
+  private chartJSNodeCanvas: ChartJSNodeCanvas | null = null;
+  private readonly width: number;
+  private readonly height: number;
   private locale = getCurrentLocale();
 
-  // Localized strings
+  // Localized strings. Keys not referenced by any chart are omitted.
   private labels = {
     en: {
       timePeriod: 'Time Period',
       amount: 'Amount',
-      value: 'Value',
       cost: 'Cost',
-      percentage: 'Percentage'
     },
     no: {
       timePeriod: 'Tidsperiode',
       amount: 'Beløp',
-      value: 'Verdi',
       cost: 'Kostnad',
-      percentage: 'Prosent'
     }
   };
 
   constructor(width: number = 800, height: number = 600) {
-    this.chartJSNodeCanvas = new ChartJSNodeCanvas({ 
-      width, 
-      height,
-      backgroundColour: 'white',
-      chartCallback: (ChartJS) => {
-        ChartJS.defaults.font.family = 'DejaVu Sans, Liberation Sans, sans-serif';
-      }
-    });
+    this.width = width;
+    this.height = height;
+  }
+
+  /**
+   * Lazily constructs the canvas renderer.
+   *
+   * `new ChartJSNodeCanvas` costs ~800 ms (it compiles Chart.js and registers
+   * font providers), and only two of this server's 31 tools draw charts. Building
+   * it at module scope paid that on every cold start; deferring it keeps the
+   * remaining 29 tools' first call fast.
+   */
+  private canvas(): ChartJSNodeCanvas {
+    if (this.chartJSNodeCanvas === null) {
+      this.chartJSNodeCanvas = new ChartJSNodeCanvas({
+        width: this.width,
+        height: this.height,
+        backgroundColour: 'white',
+        chartCallback: (ChartJS) => {
+          ChartJS.defaults.font.family = 'DejaVu Sans, Liberation Sans, sans-serif';
+        }
+      });
+    }
+    return this.chartJSNodeCanvas;
   }
 
   private getLabel(key: keyof typeof this.labels.en): string {
@@ -55,7 +69,7 @@ export class ChartGenerator {
     labels: string[], 
     values: number[], 
     title: string,
-    currency: string = 'USD'
+    currency: string = 'NOK'
   ): Promise<string> {
     const config: ChartConfiguration = {
       type: 'pie',
@@ -123,7 +137,7 @@ export class ChartGenerator {
     labels: string[], 
     values: number[], 
     title: string,
-    currency: string = 'USD'
+    currency: string = 'NOK'
   ): Promise<string> {
     const config: ChartConfiguration = {
       type: 'doughnut',
@@ -165,57 +179,6 @@ export class ChartGenerator {
     return this.renderChart(config);
   }
 
-  /**
-   * Generate a bar chart for comparisons
-   */
-  async generateBarChart(
-    labels: string[], 
-    datasets: Array<{ label: string; data: number[]; backgroundColor?: string }>,
-    title: string,
-    yAxisLabel?: string
-  ): Promise<string> {
-    const yLabel = yAxisLabel || this.getLabel('amount');
-    const config: ChartConfiguration = {
-      type: 'bar',
-      data: {
-        labels,
-        datasets: datasets.map((ds, idx) => ({
-          label: ds.label,
-          data: ds.data,
-          backgroundColor: ds.backgroundColor || this.getColorPalette(datasets.length)[idx],
-          borderColor: ds.backgroundColor || this.getColorPalette(datasets.length)[idx],
-          borderWidth: 1
-        }))
-      },
-      options: {
-        responsive: true,
-        plugins: {
-          title: {
-            display: true,
-            text: title,
-            font: { size: 18, weight: 'bold' }
-          },
-          legend: {
-            display: datasets.length > 1,
-            position: 'top',
-            labels: { font: { size: 12 } }
-          }
-        },
-        scales: {
-          y: {
-            beginAtZero: true,
-            title: {
-              display: true,
-              text: yLabel,
-              font: { size: 14 }
-            }
-          }
-        }
-      }
-    };
-
-    return this.renderChart(config);
-  }
 
   /**
    * Generate a line chart for trends over time
@@ -291,136 +254,13 @@ export class ChartGenerator {
     return this.renderChart(config);
   }
 
-  /**
-   * Generate a scatter plot for correlation analysis
-   */
-  async generateScatterPlot(
-    data: Array<{ x: number; y: number }>,
-    title: string,
-    xAxisLabel: string,
-    yAxisLabel: string,
-    pointLabels?: string[]
-  ): Promise<string> {
-    const config: ChartConfiguration = {
-      type: 'scatter',
-      data: {
-        datasets: [{
-          label: 'Data Points',
-          data: data,
-          backgroundColor: 'rgba(75, 192, 192, 0.6)',
-          borderColor: 'rgba(75, 192, 192, 1)',
-          borderWidth: 1,
-          pointRadius: 6,
-          pointHoverRadius: 8
-        }]
-      },
-      options: {
-        responsive: true,
-        plugins: {
-          title: {
-            display: true,
-            text: title,
-            font: { size: 18, weight: 'bold' }
-          },
-          legend: {
-            display: false
-          },
-          tooltip: {
-            callbacks: {
-              label: (context) => {
-                const point = context.parsed;
-                const label = pointLabels ? pointLabels[context.dataIndex] : '';
-                const x = point.x ?? 0;
-                const y = point.y ?? 0;
-                return label 
-                  ? `${label}: (${x.toFixed(2)}, ${y.toFixed(2)})`
-                  : `(${x.toFixed(2)}, ${y.toFixed(2)})`;
-              }
-            }
-          }
-        },
-        scales: {
-          x: {
-            title: {
-              display: true,
-              text: xAxisLabel,
-              font: { size: 14 }
-            }
-          },
-          y: {
-            title: {
-              display: true,
-              text: yAxisLabel,
-              font: { size: 14 }
-            }
-          }
-        }
-      }
-    };
 
-    return this.renderChart(config);
-  }
-
-  /**
-   * Generate a stacked bar chart for multi-dimensional data
-   */
-  async generateStackedBarChart(
-    labels: string[], 
-    datasets: Array<{ label: string; data: number[] }>,
-    title: string,
-    yAxisLabel: string = 'Amount'
-  ): Promise<string> {
-    const config: ChartConfiguration = {
-      type: 'bar',
-      data: {
-        labels,
-        datasets: datasets.map((ds, idx) => ({
-          label: ds.label,
-          data: ds.data,
-          backgroundColor: this.getColorPalette(datasets.length)[idx],
-          borderColor: this.getColorPalette(datasets.length)[idx],
-          borderWidth: 1
-        }))
-      },
-      options: {
-        responsive: true,
-        plugins: {
-          title: {
-            display: true,
-            text: title,
-            font: { size: 18, weight: 'bold' }
-          },
-          legend: {
-            display: true,
-            position: 'top',
-            labels: { font: { size: 12 } }
-          }
-        },
-        scales: {
-          x: {
-            stacked: true
-          },
-          y: {
-            stacked: true,
-            beginAtZero: true,
-            title: {
-              display: true,
-              text: yAxisLabel,
-              font: { size: 14 }
-            }
-          }
-        }
-      }
-    };
-
-    return this.renderChart(config);
-  }
 
   /**
    * Render chart configuration and return as base64 data URL
    */
   private async renderChart(config: ChartConfiguration): Promise<string> {
-    const imageBuffer = await this.chartJSNodeCanvas.renderToBuffer(config as any);
+    const imageBuffer = await this.canvas().renderToBuffer(config as any);
     const base64Image = imageBuffer.toString('base64');
     return `data:image/png;base64,${base64Image}`;
   }
