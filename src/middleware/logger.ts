@@ -96,9 +96,25 @@ const piiRedactionFormat = winston.format((info) => {
   return info;
 });
 
-// Create logger instance - default to 'error' level for production safety
+// Create logger instance - default to 'error' level for production safety.
+//
+// Transport strategy:
+//  - Always log to **stderr**, which is where container platforms (Azure
+//    Container Apps, Kubernetes) collect logs from. stdout is deliberately left
+//    unused.
+//  - JSON when the platform will parse/forward logs (production); human-readable
+//    otherwise.
+//  - A rotating file transport is opt-in via LOG_TO_FILE, since container
+//    filesystems are ephemeral and logs written to disk are effectively lost.
+const logLevel = process.env.LOG_LEVEL || 'error';
+const isProduction = process.env.NODE_ENV === 'production';
+const logToFile = process.env.LOG_TO_FILE === 'true';
+
+// Every level is routed to stderr so nothing ever lands on stdout.
+const ALL_LEVELS = ['error', 'warn', 'info', 'http', 'verbose', 'debug', 'silly'];
+
 export const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || 'error',
+  level: logLevel,
   format: winston.format.combine(
     winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
     winston.format.errors({ stack: true }),
@@ -107,52 +123,37 @@ export const logger = winston.createLogger({
   ),
   defaultMeta: { service: 'crayon-cost-mcp' },
   transports: [
-    // Error log
+    new winston.transports.Console({
+      level: logLevel,
+      stderrLevels: ALL_LEVELS,
+      format: isProduction
+        ? winston.format.combine(
+            winston.format.errors({ stack: true }),
+            piiRedactionFormat(),
+            winston.format.json()
+          )
+        : winston.format.combine(
+            winston.format.colorize(),
+            piiRedactionFormat(),
+            winston.format.printf(({ level, message, timestamp, ...meta }) => {
+              const redactedMeta = redactPIIFromObject(meta);
+              return `${timestamp} [${level}]: ${message} ${Object.keys(redactedMeta).length > 1 ? JSON.stringify(redactedMeta, null, 2) : ''}`;
+            })
+          ),
+    }),
+  ],
+});
+
+// Optional disk logging for local/VM runs that need log retention on the host.
+if (logToFile) {
+  logger.add(
     new winston.transports.File({
       filename: path.join(logDir, 'error.log'),
       level: 'error',
       maxsize: 10485760, // 10MB
       maxFiles: 5,
-    }),
-  ],
-});
-
-// Add console transport in development (also error-only by default)
-if (process.env.NODE_ENV !== 'production') {
-  logger.add(
-    new winston.transports.Console({
-      level: process.env.LOG_LEVEL || 'error',
-      format: winston.format.combine(
-        winston.format.colorize(),
-        piiRedactionFormat(),
-        winston.format.printf(({ level, message, timestamp, ...meta }) => {
-          const redactedMeta = redactPIIFromObject(meta);
-          return `${timestamp} [${level}]: ${message} ${Object.keys(redactedMeta).length > 1 ? JSON.stringify(redactedMeta, null, 2) : ''}`;
-        })
-      ),
     })
   );
-}
-
-/**
- * Log audit trail for data access and modifications (only on error)
- */
-export function logAudit(event: {
-  action: string;
-  userId: string;
-  organizationId: number;
-  resource: string;
-  status: 'success' | 'failure';
-  timestamp: Date;
-  details?: any;
-}): void {
-  // Only log audit events on failure
-  if (event.status === 'failure') {
-    logger.error('AUDIT_EVENT', redactPIIFromObject({
-      ...event,
-      timestamp: event.timestamp.toISOString(),
-    }));
-  }
 }
 
 /**

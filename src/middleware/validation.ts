@@ -10,7 +10,7 @@ const pageNumber = Joi.number().integer().min(1).default(1);
 /**
  * Validate regex pattern to prevent ReDoS attacks
  */
-export function validateRegexPattern(pattern: string): { error?: string; value?: string } {
+function validateRegexPattern(pattern: string): { error?: string; value?: string } {
   // Limit pattern length
   if (pattern.length > 100) {
     return { error: 'Pattern too long (max 100 characters)' };
@@ -41,7 +41,7 @@ export function validateRegexPattern(pattern: string): { error?: string; value?:
 }
 
 // Tool input schemas
-export const schemas = {
+const schemas = {
   get_organizations: Joi.object({}),
 
   get_invoice_profiles: Joi.object({
@@ -98,7 +98,15 @@ export const schemas = {
 
   update_subscription_tags: Joi.object({
     subscriptionId: positiveInteger,
-    tags: Joi.object().pattern(Joi.string(), Joi.string()).required(),
+    // The Crayon endpoint replaces the whole tag object with these fixed fields,
+    // so an arbitrary key/value map is rejected by the API.
+    tags: Joi.object({
+      costCenter: Joi.string().max(255).allow(null, '').optional(),
+      department: Joi.string().max(255).allow(null, '').optional(),
+      project: Joi.string().max(255).allow(null, '').optional(),
+      custom: Joi.string().max(255).allow(null, '').optional(),
+      owner: Joi.string().max(255).allow(null, '').optional(),
+    }).min(1).required(),
   }),
 
   track_costs_by_tags: Joi.object({
@@ -197,6 +205,22 @@ export const schemas = {
     monthsBack: Joi.number().integer().min(1).max(24).default(3),
     topN: Joi.number().integer().min(1).max(50).default(10),
     chartStyle: Joi.string().valid('pie', 'doughnut').default('pie'),
+  }),
+
+  get_aws_accounts: Joi.object({
+    organizationId: optionalInteger,
+    customerTenantId: optionalInteger,
+    search: Joi.string().max(100).optional(),
+    page: pageNumber,
+    pageSize: pageSize,
+  }),
+
+  get_aws_account_details: Joi.object({
+    accountId: positiveInteger,
+  }),
+
+  get_spend_by_cloud_provider: Joi.object({
+    organizationId: positiveInteger,
   }),
 };
 

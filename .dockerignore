@@ -1,39 +1,73 @@
-# Dependencies
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+# Files excluded from the Docker build context.
+#
+# The runtime stage of the Dockerfile copies only `dist/`, `node_modules/` and
+# `package.json` from the builder, so source and tooling cannot reach the final
+# image. This file matters for a second reason: everything not listed here is
+# uploaded to the Docker daemon (and to a remote builder/CI) as build context,
+# which slows builds and can leak local state.
 
-# Build output
+# Dependencies (rebuilt inside the image for the correct platform)
+node_modules/
+
+# Build output (produced in the builder stage)
 dist/
 build/
 *.tsbuildinfo
 
-# Environment variables
+# Environment / secrets - never send these to a builder.
+# The trailing negation keeps the committed template available if ever needed.
 .env
-.env.local
-.env.*.local
-.env.example
+.env.*
+!.env.example
 
-# IDE
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Host-run verification tooling (smoke tests, API correlation, scratch scripts).
+# These run from the host against a published port and are not needed in the image.
+scripts/
+
+# Local log output
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Infrastructure / docs not needed to build the app
+docker-compose*.yml
+README.md
+*.md
+
+# IDE / editor state
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
+# AI agent + assistant state
+.agents/
+.copilot/
+.github/
+*.chatmode.md
+*.instructions.md
+*.prompt.md
+
 # OS
 .DS_Store
 Thumbs.db
 
-# Logs
-logs/
-*.log
-
-# Testing
+# Testing / coverage output (tests run on the host, not in the image)
 coverage/
 .nyc_output/
+*.lcov
 
 # Temporary files
 tmp/
 temp/
+*.tmp
+*.temp

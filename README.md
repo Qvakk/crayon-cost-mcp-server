@@ -1,122 +1,153 @@
 # Crayon Cost MCP Server
 
-MCP server providing cost and billing analytics from Crayon CloudIQ APIs.
+MCP server exposing Crayon CloudIQ cost and billing data as **31 tools**, over
+Streamable HTTP using the latest MCP protocol revision (**2026-07-28**).
 
-## Quick Start (5 Minutes)
+Callers are authorized with **Entra ID app roles**; the Crayon API is always
+called with the server's own credentials.
 
-### 1. Get Credentials
-Contact your Crayon account team to obtain:
-- Client ID
-- Client Secret
-- Username
-- Password 
+---
 
-### 2. Setup Environment
+## Architecture
 
-**Linux/Mac:**
+```mermaid
+flowchart LR
+  C[MCP client] -->|Bearer token| AG[Application Gateway]
+  AG --> APIM[API Management<br/>validates JWT + app roles]
+  APIM -->|user token forwarded| CA[Container App<br/>crayon-cost-mcp]
+  CA -->|service credentials| CR[Crayon CloudIQ API]
+```
+
+| Component | Responsibility |
+| --- | --- |
+| **Application Gateway** | WAF, TLS, ingress |
+| **API Management** | Validates the caller's Entra JWT and gates on app roles; forwards the user token via `X-Inbound-Authorization` |
+| **Container App** | Re-validates the token itself, applies the app-role gate per tool, then calls Crayon with its own credentials |
+
+The container **re-validates every token independently**. APIM is not treated as
+a sufficient trust boundary — a bypassed or misrouted gateway must not become
+unauthenticated access to cost data.
+
+---
+
+## Configuration
+
+### 1. Crayon API credentials — always required
+
+These identify the server to Crayon CloudIQ and are needed in **every** auth
+mode. The caller never supplies them; all Crayon calls run under this service
+identity.
+
+| Variable | Description |
+| --- | --- |
+| `CRAYON_CLIENT_ID` | OAuth client ID |
+| `CRAYON_CLIENT_SECRET` | OAuth client secret |
+| `CRAYON_USERNAME` | Delegated username |
+| `CRAYON_PASSWORD` | Delegated password |
+| `CRAYON_API_BASE_URL` | Optional, defaults to `https://api.crayon.com/api/v1` |
+
+Obtain these from your Crayon account team. In Azure Container Apps they must be
+stored as **container secrets**, never as plain environment values.
+
+### 2. Entra ID app roles — required for the APIM deployment
+
+Two app roles are defined on the **API app registration** and surfaced in the
+token's `roles` claim:
+
+| App role | Grants | Applied to |
+| --- | --- | --- |
+| `user.read` | All read/analytics tools | 30 tools |
+| `user.write` | Mutating tools | `update_subscription_tags` |
+
+A caller needs `user.read` for reads and `user.write` for writes. **`user.write`
+does not imply `user.read`** — grant both to an editor. Tools with no explicit
+policy default to `user.read`.
+
+| Variable | Required | Default |
+| --- | --- | --- |
+| `AUTH_MODE` | yes (in Azure: `entra`) | inferred from `ENTRA_*` |
+| `ENTRA_TENANT_ID` | yes | — |
+| `ENTRA_AUDIENCE` | yes (e.g. `api://<api-client-id>`) | — |
+| `ENTRA_READ_ROLE` | optional | `user.read` |
+| `ENTRA_WRITE_ROLE` | optional | `user.write` |
+| `ENTRA_REQUIRED_SCOPE` | optional | — |
+| `ENTRA_JWKS_URI` | optional (private endpoints / tests) | derived |
+
+The role **names** must match the app registration manifest; the environment
+variables only need setting if you rename them.
+
+### 3. Access scope
+
+| Variable | Purpose |
+| --- | --- |
+| `ALLOWED_ORGANIZATIONS` | Comma-separated organization IDs callers may read |
+| `ALLOWED_WRITE_ORGANIZATIONS` | Organizations that may be mutated (empty = all readable ones) |
+
+See `.env.example` for the full set, including rate limits, timeouts and
+circuit-breaker thresholds.
+
+---
+
+## Authorization
+
+Two independent checks, both required:
+
+1. **Transport** — validates the Entra token (signature, issuer, audience,
+   expiry) and publishes the caller's app roles.
+2. **Tool dispatch** — one gate for every invocation, run *before* validation and
+   before any Crayon call: app role → organization allowlist → write-organization
+   allowlist. Denials return a normal MCP tool error.
+
+> **Adding a mutating tool?** Register it in `TOOL_POLICIES` in
+> `src/middleware/auth.ts`. The default policy is read-only, so an unreviewed
+> tool can never silently become write-capable.
+
+---
+
+## Deployment (Azure Container Apps)
+
+| Property | Value |
+| --- | --- |
+| Image payload | `dist/`, production `node_modules/`, `package.json` (~69 MB) |
+| Port | `3003` on `0.0.0.0` — set `ingress.targetPort` to match |
+| User | non-root `nodejs` (uid/gid 1001) |
+| Protocols | `2026-07-28` only; 2025-era clients are rejected |
+| Logs | **stderr** only |
+| Shutdown | handles `SIGTERM` (revision restart / scale-in) |
+
+**Probes** — ACA ignores the Dockerfile `HEALTHCHECK`, so configure these on the
+container app. `GET /health` is unauthenticated by design so probes pass:
+
+- **Startup** `/health` — initial delay 5s, period 5s, failure threshold 12
+- **Liveness** `/health` — period 30s
+- **Readiness** `/health` — period 10s
+
+**Endpoints** — `POST /mcp` (MCP), `GET /health` (probes), `GET /metrics` (auth required).
+
 ```bash
-# Clone repository
-git clone <your-repo-url>
-cd crayon-cost-mcp-server
-
-# Copy environment template
-cp .env.example .env
+docker build -t <registry>/crayon-cost-mcp:<tag> .
 ```
 
-**Windows (PowerShell):**
-```powershell
-# Clone repository
-git clone <your-repo-url>
-cd crayon-cost-mcp-server
+The build **fails** if source, test tooling, or build-only dependencies ever reach
+the runtime image, so a `.dockerignore` drift cannot silently ship.
 
-# Copy environment template
-Copy-Item .env.example .env
-```
+---
 
-### 3. Configure Credentials
-
-Edit `.env` file and fill in your Crayon credentials and authentication token:
+## Development
 
 ```bash
-# Required - Get from Crayon account team
-CRAYON_CLIENT_ID=your_client_id_here
-CRAYON_CLIENT_SECRET=your_client_secret_here
-CRAYON_USERNAME=your_username_here
-CRAYON_PASSWORD=your_password_here
-
-# Required - Generate secure Bearer token (32+ characters)
-# Run: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-AUTH_TOKEN=paste_generated_secure_token_here
+npm install
+npm run build          # compile TypeScript
+npm run test:smoke     # HTTP, auth-gate and Entra JWT checks
+npm run test:tools     # drives all 31 tools, validates calls against the Crayon OpenAPI spec
 ```
 
-**Note:** The `.env.example` file contains all available configuration options with detailed comments. The above are the minimum required settings to get started.
+Both suites run without a Crayon account or Entra tenant: the tool suite serves a
+mock Crayon API and asserts every tool reaches a spec-valid endpoint.
 
-### 4. Run Locally with Docker
-
-```bash
-docker-compose up -d
-```
-
-### 5. Verify It's Running
-
-```bash
-# Test health endpoint
-curl http://localhost:3003/health
-
-# Expected: {"status":"ok","timestamp":"2025-11-11T..."}
-```
-
-## Available MCP Tools
-
-The server provides **26 tools** for comprehensive cost analysis:
-
-### Core Tools
-- **`get_organizations`** - List all accessible organizations
-- **`get_billing_statements`** - Monthly billing data with filters
-- **`get_grouped_billing_statements`** - Aggregated billing by cycles
-- **`get_invoices`** - Invoice details and status
-- **`get_invoice_profiles`** - Billing group profiles
-- **`get_cost_summary`** - Combined cost analysis
-- **`get_customer_tenants`** - Customer tenant information for correlation
-
-### Azure-Specific Tools
-- **`get_azure_usage`** - Detailed Azure consumption (CSV download)
-- **`get_azure_subscriptions`** - Azure subscriptions by tenant
-- **`get_azure_plan_details`** - Azure plan information with subscriptions
-- **`get_azure_plan_subscriptions`** - All subscriptions in an Azure plan
-- **`get_azure_costs_by_date_range`** - Total Azure costs for date range
-- **`get_azure_costs_by_subscription`** - Subscription-specific Azure costs
-
-### Subscription Management
-- **`get_subscriptions`** - All cloud subscriptions (Azure, AWS, etc.)
-- **`get_subscription_details`** - Detailed subscription info with metadata
-- **`get_subscription_tags`** - Tags for cost allocation and tracking
-- **`update_subscription_tags`** - Update subscription tags for organization
-- **`list_all_subscriptions_with_tags`** - Complete subscription and tag inventory
-
-### Advanced Analytics & Visualization
-- **`get_historical_costs`** - Multi-month cost history for forecasting
-- **`get_cost_by_subscription`** - Cost breakdown by subscription with **pie/doughnut chart**
-- **`track_costs_by_tags`** - Cost allocation by tags (department, project, environment)
-- **`get_cost_trends`** - Month-over-month trends with **line chart visualization**
-- **`detect_cost_anomalies`** - Identify subscriptions with unexpected cost spikes
-- **`analyze_costs_by_tags`** - Breakdown costs by CostCenter, Department, Project, etc.
-- **`find_similar_subscriptions_and_invoices`** - Find related subscriptions by name pattern
-- **`get_last_month_costs_by_tags`** - Last month cost breakdown by tags
-- **`get_last_month_costs_by_invoice_profile`** - Last month costs per invoice profile
-- **`get_last_month_costs_by_organization`** - Last month total by organization
-
-### Key Features
-- All historical cost tools use **complete billing months** (start from 1st of month)
-- **Chart visualization** for trend analysis and cost distribution
-- **Proper font rendering** with DejaVu Sans, Liberation, and Noto fonts
-- **Correlation tools** to link billing data with Azure/AWS resources
-- **Tag-based analytics** for departmental cost allocation
+---
 
 ## Support
 
-For Crayon CloudIQ API documentation:
-https://apidocs.crayon.com/
-
-For MCP protocol documentation:
-https://modelcontextprotocol.io/
+- Crayon CloudIQ API: <https://apidocs.crayon.com/>
+- MCP protocol: <https://modelcontextprotocol.io/>

@@ -6,12 +6,28 @@ export interface AppConfig {
   port: number;
   host: string;
   nodeEnv: string;
-  transportMode: 'http' | 'stdio';
   
   // Authentication
   authEnabled: boolean;
+  authMode: AuthMode;
   authToken: string | null;
+
+  // Entra ID (Azure AD) token validation
+  entraTenantId: string | null;
+  /** Authority host. Override for sovereign clouds (e.g. login.microsoftonline.us). */
+  entraAuthorityHost: string;
+  /** Explicit JWKS URL. Overrides the URL derived from the authority host. */
+  entraJwksUri: string | null;
+  entraAudience: string | null;
+  entraRequiredScope: string | null;
+  /** App role required for read-only tool calls. */
+  entraReadRole: string;
+  /** App role required for mutating (write/edit) tool calls. */
+  entraWriteRole: string;
+
   allowedOrganizations: number[];
+  /** Organization IDs a write-capable caller may mutate. Empty = all allowed orgs. */
+  allowedWriteOrganizations: number[];
   
   // Crayon API
   crayonClientId: string;
@@ -30,13 +46,12 @@ export interface AppConfig {
   circuitBreakerTimeoutMs: number;
   
   // Session
-  sessionTimeoutMs: number;
+  /**
+   * Interval for periodic housekeeping (currently: pruning expired circuit-breaker
+   * metric snapshots is handled internally by opossum). Kept as a named knob so
+   * operators can tune housekeeping frequency without a code change.
+   */
   sessionCleanupIntervalMs: number;
-  
-  // Cache
-  cacheEnabled: boolean;
-  cacheTtlMs: number;
-  cacheMaxSize: number;
   
   // Request
   requestTimeoutMs: number;
@@ -44,6 +59,18 @@ export interface AppConfig {
   // Logging
   logLevel: string;
 }
+
+/**
+ * Authentication strategies.
+ *
+ * - `none`  : auth disabled (local development only).
+ * - `token` : legacy single shared `AUTH_TOKEN`, compared in constant time.
+ *             Kept for local/compose use; not suitable for the APIM-fronted
+ *             Container App deployment.
+ * - `entra` : Entra ID (Azure AD) OAuth2 access tokens with app-role and
+ *             scope validation. This is the mode used behind APIM.
+ */
+export type AuthMode = 'none' | 'token' | 'entra';
 
 /**
  * Configuration validation errors
@@ -62,7 +89,6 @@ class ConfigValidationError extends Error {
  */
 export function loadConfig(): AppConfig {
   const errors: string[] = [];
-  
   // Helper functions
   const requireEnv = (name: string): string => {
     const value = process.env[name];
@@ -105,9 +131,71 @@ export function loadConfig(): AppConfig {
   // Auth configuration
   const authEnabled = parseBoolEnv('AUTH_ENABLED', true);
   const authToken = process.env.AUTH_TOKEN || null;
-  
-  if (authEnabled && !authToken) {
-    errors.push('AUTH_TOKEN is required when AUTH_ENABLED is true');
+
+  // Explicit AUTH_MODE wins; otherwise infer from what has been configured so
+  // existing deployments (AUTH_TOKEN only) keep working unchanged.
+  const configuredAuthMode = (process.env.AUTH_MODE || '').toLowerCase();
+  const entraConfigured = Boolean(process.env.ENTRA_TENANT_ID || process.env.ENTRA_AUDIENCE);
+
+  let authMode: AuthMode;
+  if (!authEnabled) {
+    authMode = 'none';
+  } else if (configuredAuthMode === 'entra' || (configuredAuthMode === '' && entraConfigured)) {
+    authMode = 'entra';
+  } else if (configuredAuthMode === 'token' || configuredAuthMode === '' || configuredAuthMode === 'none') {
+    // `AUTH_ENABLED=true` with no Entra config means the legacy shared token.
+    authMode = configuredAuthMode === 'none' ? 'none' : 'token';
+  } else {
+    errors.push(`Invalid AUTH_MODE: ${configuredAuthMode}. Must be 'entra', 'token' or 'none'`);
+    authMode = 'token';
+  }
+
+  const entraTenantId = process.env.ENTRA_TENANT_ID || null;
+  // Sovereign clouds use a different authority host (e.g. login.microsoftonline.us).
+  const entraAuthorityHost = optionalEnv('ENTRA_AUTHORITY_HOST', 'login.microsoftonline.com');
+  // Explicit JWKS URL: needed behind private endpoints / proxies, and for testing.
+  const entraJwksUri = process.env.ENTRA_JWKS_URI || null;
+  const entraAudience = process.env.ENTRA_AUDIENCE || null;
+  const entraRequiredScope = process.env.ENTRA_REQUIRED_SCOPE || null;
+  const entraReadRole = optionalEnv('ENTRA_READ_ROLE', 'user.read');
+  const entraWriteRole = optionalEnv('ENTRA_WRITE_ROLE', 'user.write');
+
+  // Per-mode requirements
+  if (authMode === 'token' && !authToken) {
+    errors.push('AUTH_TOKEN is required when AUTH_MODE is "token" (or set AUTH_MODE=entra)');
+  }
+
+  if (authMode === 'entra') {
+    if (!entraTenantId) {
+      errors.push('ENTRA_TENANT_ID is required when AUTH_MODE is "entra"');
+    } else if (!/^[0-9a-fA-F-]{36}$|^[a-zA-Z0-9.-]+$/.test(entraTenantId)) {
+      errors.push(`Invalid ENTRA_TENANT_ID: ${entraTenantId}. Expected a tenant GUID or domain`);
+    }
+    // Accept both a bare client id and the `api://<client-id>` form.
+    if (!entraAudience) {
+      errors.push('ENTRA_AUDIENCE is required when AUTH_MODE is "entra" (e.g. api://<api-client-id>)');
+    }
+    if (!entraReadRole) {
+      errors.push('ENTRA_READ_ROLE must not be empty when AUTH_MODE is "entra"');
+    }
+    if (!entraWriteRole) {
+      errors.push('ENTRA_WRITE_ROLE must not be empty when AUTH_MODE is "entra"');
+    }
+  }
+
+  const allowedOrganizations = parseArrayEnv('ALLOWED_ORGANIZATIONS');
+  const allowedWriteOrganizations = parseArrayEnv('ALLOWED_WRITE_ORGANIZATIONS');
+
+  // Warn (don't fail) if write orgs are not a subset of read orgs — that would
+  // grant write access to an organization the caller cannot even read.
+  if (
+    allowedWriteOrganizations.length > 0 &&
+    allowedOrganizations.length > 0 &&
+    allowedWriteOrganizations.some((id) => !allowedOrganizations.includes(id))
+  ) {
+    console.warn(
+      'WARNING: ALLOWED_WRITE_ORGANIZATIONS contains organization IDs not present in ALLOWED_ORGANIZATIONS'
+    );
   }
   
   // Build configuration
@@ -116,12 +204,23 @@ export function loadConfig(): AppConfig {
     port: parseIntEnv('PORT', 3003),
     host: optionalEnv('HOST', '0.0.0.0'),
     nodeEnv: optionalEnv('NODE_ENV', 'development'),
-    transportMode: (optionalEnv('TRANSPORT_MODE', 'http') as 'http' | 'stdio'),
     
     // Authentication
     authEnabled,
+    authMode,
     authToken,
-    allowedOrganizations: parseArrayEnv('ALLOWED_ORGANIZATIONS'),
+
+    // Entra ID (Azure AD)
+    entraTenantId,
+    entraAuthorityHost,
+    entraJwksUri,
+    entraAudience,
+    entraRequiredScope,
+    entraReadRole,
+    entraWriteRole,
+
+    allowedOrganizations,
+    allowedWriteOrganizations,
     
     // Crayon API
     crayonClientId: requireEnv('CRAYON_CLIENT_ID'),
@@ -140,13 +239,8 @@ export function loadConfig(): AppConfig {
     circuitBreakerTimeoutMs: parseIntEnv('CIRCUIT_BREAKER_TIMEOUT_MS', 30000),
     
     // Session
-    sessionTimeoutMs: parseIntEnv('SESSION_TIMEOUT_MS', 1800000),
+    /** Interval for periodic housekeeping, in milliseconds. */
     sessionCleanupIntervalMs: parseIntEnv('SESSION_CLEANUP_INTERVAL_MS', 60000),
-    
-    // Cache
-    cacheEnabled: parseBoolEnv('CACHE_ENABLED', true),
-    cacheTtlMs: parseIntEnv('CACHE_TTL_MS', 300000), // 5 minutes
-    cacheMaxSize: parseIntEnv('CACHE_MAX_SIZE', 100),
     
     // Request
     requestTimeoutMs: parseIntEnv('REQUEST_TIMEOUT_MS', 60000),
@@ -154,11 +248,6 @@ export function loadConfig(): AppConfig {
     // Logging
     logLevel: optionalEnv('LOG_LEVEL', 'error'),
   };
-  
-  // Validate transport mode
-  if (!['http', 'stdio'].includes(config.transportMode)) {
-    errors.push(`Invalid TRANSPORT_MODE: ${config.transportMode}. Must be 'http' or 'stdio'`);
-  }
   
   // Validate port range
   if (config.port < 1 || config.port > 65535) {
@@ -185,10 +274,9 @@ export interface AppMetrics {
   startTime: number;
   requestCount: number;
   errorCount: number;
+  /** Invocation count per tool name. */
   toolCalls: Record<string, number>;
   circuitBreakerTrips: number;
-  cacheHits: number;
-  cacheMisses: number;
 }
 
 /**
@@ -201,77 +289,21 @@ export function createMetrics(): AppMetrics {
     errorCount: 0,
     toolCalls: {},
     circuitBreakerTrips: 0,
-    cacheHits: 0,
-    cacheMisses: 0,
   };
 }
 
 /**
- * Simple in-memory cache with TTL
+ * Memoized configuration.
+ *
+ * `loadConfig()` is called at import time in more than one module; caching the
+ * result keeps validation a one-time cost and guarantees every module sees the
+ * identical, already-validated configuration object.
  */
-export class SimpleCache<T> {
-  private cache = new Map<string, { value: T; expiry: number }>();
-  
-  constructor(
-    private ttlMs: number,
-    private maxSize: number
-  ) {}
-  
-  get(key: string): T | undefined {
-    const entry = this.cache.get(key);
-    if (!entry) return undefined;
-    
-    if (Date.now() > entry.expiry) {
-      this.cache.delete(key);
-      return undefined;
-    }
-    
-    return entry.value;
+let cachedConfig: AppConfig | null = null;
+
+export function resolveConfig(): AppConfig {
+  if (cachedConfig === null) {
+    cachedConfig = loadConfig();
   }
-  
-  set(key: string, value: T): void {
-    // Evict oldest entries if at capacity
-    if (this.cache.size >= this.maxSize) {
-      const oldestKey = this.cache.keys().next().value;
-      if (oldestKey) this.cache.delete(oldestKey);
-    }
-    
-    this.cache.set(key, {
-      value,
-      expiry: Date.now() + this.ttlMs,
-    });
-  }
-  
-  has(key: string): boolean {
-    return this.get(key) !== undefined;
-  }
-  
-  delete(key: string): boolean {
-    return this.cache.delete(key);
-  }
-  
-  clear(): void {
-    this.cache.clear();
-  }
-  
-  size(): number {
-    return this.cache.size;
-  }
-  
-  /**
-   * Clean up expired entries
-   */
-  cleanup(): number {
-    const now = Date.now();
-    let cleaned = 0;
-    
-    for (const [key, entry] of this.cache.entries()) {
-      if (now > entry.expiry) {
-        this.cache.delete(key);
-        cleaned++;
-      }
-    }
-    
-    return cleaned;
-  }
+  return cachedConfig;
 }
