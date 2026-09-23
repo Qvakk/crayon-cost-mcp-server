@@ -79,13 +79,29 @@ function getJwks(tenantId: string) {
 }
 
 /**
- * Accepted `aud` values. Entra emits the bare client id for v1-style tokens and
- * `api://<client-id>` for v2 tokens, so accept both forms of the configured
- * audience.
+ * Expands the configured audiences into every `aud` form Entra may emit.
+ *
+ * Each configured value is used verbatim, plus the equivalent forms Entra is
+ * known to produce for it:
+ *
+ *  - `api://<app-id>`      → also the bare client id (v1-style tokens)
+ *  - bare client id/app id → also the `api://` form
+ *  - any other full URI    → verbatim only (e.g. the public MCP URL, which is
+ *                            what MCP clients request as their RFC 8707
+ *                            `resource` and therefore what lands in `aud`)
  */
-function acceptedAudiences(audience: string): string[] {
-  const bare = audience.startsWith('api://') ? audience.slice('api://'.length) : audience;
-  return [...new Set([audience, bare, `api://${bare}`])];
+function acceptedAudiences(audiences: string[]): string[] {
+  const expanded = audiences.flatMap((audience) => {
+    if (audience.startsWith('api://')) {
+      return [audience, audience.slice('api://'.length)];
+    }
+    // A full URI (the public MCP URL) has no alternate spelling in `aud`.
+    if (audience.includes('://')) {
+      return [audience];
+    }
+    return [audience, `api://${audience}`];
+  });
+  return [...new Set(expanded)];
 }
 
 /** Stable, non-reversible identifier for logging (never log raw tokens). */
@@ -105,9 +121,9 @@ interface EntraIdentity {
  * Throws on any validation failure — never returns a partially trusted result.
  */
 async function verifyEntraToken(token: string): Promise<EntraIdentity> {
-  const { entraTenantId, entraAuthorityHost, entraAudience, entraRequiredScope } = config;
+  const { entraTenantId, entraAuthorityHost, entraAudiences, entraRequiredScope } = config;
 
-  if (!entraTenantId || !entraAudience) {
+  if (!entraTenantId || entraAudiences.length === 0) {
     // loadConfig() enforces this in entra mode; defensive guard for clarity.
     throw new Error('Entra authentication is not fully configured');
   }
@@ -118,7 +134,7 @@ async function verifyEntraToken(token: string): Promise<EntraIdentity> {
       `https://${entraAuthorityHost}/${entraTenantId}/v2.0`,
       `https://sts.windows.net/${entraTenantId}/`,
     ],
-    audience: acceptedAudiences(entraAudience),
+    audience: acceptedAudiences(entraAudiences),
   });
 
   const claims = payload as JWTPayload & {
@@ -384,6 +400,21 @@ export function callerFromAuthInfo(
     ? (authInfo.extra.roles as unknown[]).filter((r): r is string => typeof r === 'string')
     : [];
   return { id: authInfo.clientId || 'unknown', roles };
+}
+
+/**
+ * Whether the caller holds the app role the named tool requires.
+ *
+ * Drives the ADVERTISED `tools/list` surface so a caller is never shown a tool
+ * it cannot invoke (e.g. the mutating tag tool for a read-only user). That
+ * avoids a wasted round-trip and a confusing Forbidden result for the model.
+ *
+ * This is discovery-time hygiene only, NOT a security boundary: a tool that is
+ * filtered out here is still refused by {@link enforceToolPolicy} if a client
+ * invokes it by name anyway.
+ */
+export function canInvokeTool(toolName: string, caller: Caller): boolean {
+  return caller.roles.includes(resolveToolPolicy(toolName).role);
 }
 
 /** MCP tool error shape returned by {@link enforceToolPolicy}. */

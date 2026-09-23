@@ -51,27 +51,48 @@ stored as **container secrets**, never as plain environment values.
 
 ### 2. Entra ID app roles — required for the APIM deployment
 
-Two app roles are defined on the **API app registration** and surfaced in the
-token's `roles` claim:
+**Exactly two app roles** are defined on the **API app registration** and
+surfaced in the token's `roles` claim:
 
 | App role | Grants | Applied to |
 | --- | --- | --- |
-| `user.read` | All read/analytics tools | 30 tools |
+| `user.read` | All read/analytics tools | 30 tools (the default policy) |
 | `user.write` | Mutating tools | `update_subscription_tags` |
 
 A caller needs `user.read` for reads and `user.write` for writes. **`user.write`
 does not imply `user.read`** — grant both to an editor. Tools with no explicit
 policy default to `user.read`.
 
+> **There is deliberately no `user.mcp` role here.** That role exists on
+> `ipam-mcp` to separate MCP-surface access from REST-surface access on the same
+> container. This server exposes a single MCP surface (`POST /mcp`), so such a
+> role would gate nothing that the two data roles do not — see the APIM note in
+> §Authorization for how the edge gate is expressed without it.
+
 | Variable | Required | Default |
 | --- | --- | --- |
 | `AUTH_MODE` | yes (in Azure: `entra`) | inferred from `ENTRA_*` |
 | `ENTRA_TENANT_ID` | yes | — |
-| `ENTRA_AUDIENCE` | yes (e.g. `api://<api-client-id>`) | — |
+| `ENTRA_AUDIENCES` | yes — **space-separated list** (see below) | — |
 | `ENTRA_READ_ROLE` | optional | `user.read` |
 | `ENTRA_WRITE_ROLE` | optional | `user.write` |
 | `ENTRA_REQUIRED_SCOPE` | optional | — |
 | `ENTRA_JWKS_URI` | optional (private endpoints / tests) | derived |
+
+**`ENTRA_AUDIENCES` must list every accepted `aud` form.** Entra stamps `aud`
+with the identifier URI the client used as its OAuth `resource` (RFC 8707),
+and MCP clients request the **public MCP URL**. Both the public URL and the
+`api://` identifier URI must therefore be listed, and each must exist as an
+identifier URI on the app registration:
+
+```
+ENTRA_AUDIENCES="api://<api-client-id> https://mcp.frid-iks.no/crayon-mcp"
+```
+
+Omitting the public URL 401s every MCP client (`AADSTS500011` on the client
+side, `invalid audience` on the server side); omitting the `api://` form 401s
+service/legacy callers. `ENTRA_AUDIENCE` (singular) is still read as a
+single-value alias for existing deployments and `docker-compose.yml`.
 
 The role **names** must match the app registration manifest; the environment
 variables only need setting if you rename them.
@@ -101,6 +122,27 @@ Two independent checks, both required:
 > **Adding a mutating tool?** Register it in `TOOL_POLICIES` in
 > `src/middleware/auth.ts`. The default policy is read-only, so an unreviewed
 > tool can never silently become write-capable.
+### Gateway edge gate
+
+Behind APIM/App Gateway the per-API `validate-jwt` policy requires **any one**
+of the two app roles:
+
+```hcl
+required_scopes = ["user.read", "user.write"]   # match="any" → ORed
+```
+
+Because this server has a single surface, the edge gate is an *app-access* gate
+("is this caller provisioned for this API at all?"), not an operation gate. The
+container then enforces the precise per-tool role on top.
+
+> Do **not** narrow the edge to `["user.read"]`. A caller holding only
+> `user.write` would then be refused at the gateway and could never reach the
+> very tool that role exists for — even though the container would have allowed
+> it. `match="any"` ORs the values, so listing both is what keeps the gate
+> equivalent to "has at least one role of this API".
+
+Both roles must exist in the app registration manifest and be assigned via
+groups. Editors need **both** roles — `user.write` does not imply `user.read`.
 
 ---
 

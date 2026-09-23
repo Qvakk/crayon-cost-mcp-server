@@ -15,7 +15,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { CrayonApiClient, priceValue, priceCurrency } from './crayon-client.js';
 import { logger, logToolExecution, logSecurityEvent } from './middleware/logger.js';
-import { authenticateRequest, callerFromAuthInfo, enforceToolPolicy } from './middleware/auth.js';
+import { authenticateRequest, callerFromAuthInfo, canInvokeTool, enforceToolPolicy } from './middleware/auth.js';
 import { validateToolInput } from './middleware/validation.js';
 import { sanitizeErrorMessage, createCircuitBreakerWrapper } from './middleware/security.js';
 import { chartGenerator } from './utils/chart-generator.js';
@@ -709,10 +709,20 @@ function createServer(): Server {
     }
   );
 
-  // Handle list tools request
-  server.setRequestHandler('tools/list', async () => ({
-    tools,
-  }));
+  // Handle list tools request.
+  //
+  // The advertised surface is filtered to the tools the caller's app roles
+  // permit, so a read-only caller is never shown `update_subscription_tags`
+  // (which it could not invoke). Callers therefore see 30 or 31 tools depending
+  // on their roles. This is discovery-only — `enforceToolPolicy` at dispatch
+  // time remains the authoritative gate, so a tool invoked by name despite being
+  // hidden is still refused.
+  server.setRequestHandler('tools/list', async (_request: unknown, ctx: ServerContext) => {
+    const caller = callerFromAuthInfo(ctx.http?.authInfo);
+    return {
+      tools: tools.filter((tool) => canInvokeTool(tool.name, caller)),
+    };
+  });
 
   // Handle tool execution
   server.setRequestHandler('tools/call', async (request: CallToolRequest, ctx: ServerContext) => {
@@ -1427,7 +1437,7 @@ async function startServer(): Promise<void> {
 
     if (config.authMode === 'entra') {
       console.error(`  tenant:    ${config.entraTenantId}`);
-      console.error(`  audience:  ${config.entraAudience}`);
+      console.error(`  audiences: ${config.entraAudiences.join(' ')}`);
       console.error(`  roles:     ${config.entraReadRole} (read), ${config.entraWriteRole} (write)`);
     } else if (config.authMode === 'token') {
       // Never print the token itself; note only that one is configured.

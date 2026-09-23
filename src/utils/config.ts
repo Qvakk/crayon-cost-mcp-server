@@ -18,7 +18,16 @@ export interface AppConfig {
   entraAuthorityHost: string;
   /** Explicit JWKS URL. Overrides the URL derived from the authority host. */
   entraJwksUri: string | null;
-  entraAudience: string | null;
+  /**
+   * Accepted `aud` values for Entra access tokens.
+   *
+   * Entra stamps `aud` with the identifier URI the client used as its OAuth
+   * `resource` (RFC 8707). MCP clients request the PUBLIC MCP URL, so their
+   * tokens carry that URL; service/legacy flows request `api://<app-id>`; and
+   * v1-style tokens carry the bare client id. Every accepted form must be
+   * listed — an omitted form 401s that entire class of caller.
+   */
+  entraAudiences: string[];
   entraRequiredScope: string | null;
   /** App role required for read-only tool calls. */
   entraReadRole: string;
@@ -135,7 +144,9 @@ export function loadConfig(): AppConfig {
   // Explicit AUTH_MODE wins; otherwise infer from what has been configured so
   // existing deployments (AUTH_TOKEN only) keep working unchanged.
   const configuredAuthMode = (process.env.AUTH_MODE || '').toLowerCase();
-  const entraConfigured = Boolean(process.env.ENTRA_TENANT_ID || process.env.ENTRA_AUDIENCE);
+  const entraConfigured = Boolean(
+    process.env.ENTRA_TENANT_ID || process.env.ENTRA_AUDIENCES || process.env.ENTRA_AUDIENCE
+  );
 
   let authMode: AuthMode;
   if (!authEnabled) {
@@ -155,7 +166,13 @@ export function loadConfig(): AppConfig {
   const entraAuthorityHost = optionalEnv('ENTRA_AUTHORITY_HOST', 'login.microsoftonline.com');
   // Explicit JWKS URL: needed behind private endpoints / proxies, and for testing.
   const entraJwksUri = process.env.ENTRA_JWKS_URI || null;
-  const entraAudience = process.env.ENTRA_AUDIENCE || null;
+  // Accepted audiences: a space- or comma-separated list. ENTRA_AUDIENCE
+  // (singular) is retained as an alias for a single value so existing
+  // deployments and docker-compose files keep working unchanged.
+  const entraAudiences = (process.env.ENTRA_AUDIENCES || process.env.ENTRA_AUDIENCE || '')
+    .split(/[\s,]+/)
+    .map((audience) => audience.trim())
+    .filter(Boolean);
   const entraRequiredScope = process.env.ENTRA_REQUIRED_SCOPE || null;
   const entraReadRole = optionalEnv('ENTRA_READ_ROLE', 'user.read');
   const entraWriteRole = optionalEnv('ENTRA_WRITE_ROLE', 'user.write');
@@ -171,9 +188,13 @@ export function loadConfig(): AppConfig {
     } else if (!/^[0-9a-fA-F-]{36}$|^[a-zA-Z0-9.-]+$/.test(entraTenantId)) {
       errors.push(`Invalid ENTRA_TENANT_ID: ${entraTenantId}. Expected a tenant GUID or domain`);
     }
-    // Accept both a bare client id and the `api://<client-id>` form.
-    if (!entraAudience) {
-      errors.push('ENTRA_AUDIENCE is required when AUTH_MODE is "entra" (e.g. api://<api-client-id>)');
+    // List EVERY accepted audience form, not just one: `aud` follows the
+    // OAuth `resource` the client requested, so MCP clients produce the public
+    // MCP URL while service/legacy flows produce api://<app-id>.
+    if (entraAudiences.length === 0) {
+      errors.push(
+        'ENTRA_AUDIENCES is required when AUTH_MODE is "entra" — list every accepted audience, e.g. "api://<api-client-id> https://mcp.frid-iks.no/my-mcp"'
+      );
     }
     if (!entraReadRole) {
       errors.push('ENTRA_READ_ROLE must not be empty when AUTH_MODE is "entra"');
@@ -214,7 +235,7 @@ export function loadConfig(): AppConfig {
     entraTenantId,
     entraAuthorityHost,
     entraJwksUri,
-    entraAudience,
+    entraAudiences,
     entraRequiredScope,
     entraReadRole,
     entraWriteRole,

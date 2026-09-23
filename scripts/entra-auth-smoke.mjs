@@ -11,6 +11,9 @@ const APP_PORT = process.env.SMOKE_PORT || '3115';
 const BASE = `http://127.0.0.1:${APP_PORT}`;
 const TENANT = '11111111-2222-3333-4444-555555555555';
 const AUDIENCE = 'api://crayon-cost-mcp';
+// MCP clients request the PUBLIC MCP URL as their RFC 8707 `resource`, so Entra
+// stamps THAT URL into `aud`. Both forms must be accepted.
+const PUBLIC_URL = 'https://mcp.frid-iks.no/crayon-cost-mcp';
 const AUTHORITY_HOST = `127.0.0.1:${JWKS_PORT}`;
 const ISSUER = `https://${AUTHORITY_HOST}/${TENANT}/v2.0`;
 
@@ -54,7 +57,7 @@ const child = spawn(process.execPath, ['dist/index.js'], {
     ENTRA_TENANT_ID: TENANT,
     ENTRA_AUTHORITY_HOST: AUTHORITY_HOST,
     ENTRA_JWKS_URI: `http://${AUTHORITY_HOST}/discovery/v2.0/keys`,
-    ENTRA_AUDIENCE: AUDIENCE,
+    ENTRA_AUDIENCES: `${AUDIENCE} ${PUBLIC_URL}`,
     ENTRA_READ_ROLE: 'user.read',
     ENTRA_WRITE_ROLE: 'user.write',
     ALLOWED_ORGANIZATIONS: '4040561',
@@ -107,15 +110,50 @@ async function main() {
     return { status: r.status, json: parseSse(text) ?? (() => { try { return JSON.parse(text); } catch { return null; } })() };
   };
 
+  const listTools = async (token) => {
+    const r = await fetch(`${BASE}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        'MCP-Protocol-Version': '2026-07-28',
+        'Mcp-Method': 'tools/list',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'tools/list', params: { _meta: envelope } }),
+    });
+    const text = await r.text();
+    const json = parseSse(text) ?? (() => { try { return JSON.parse(text); } catch { return null; } })();
+    return (json?.result?.tools ?? []).map((t) => t.name);
+  };
+
   const readOnly = await signToken({ roles: ['user.read'] });
   const readWrite = await signToken({ roles: ['user.read', 'user.write'] });
   const noRoles = await signToken({});
   const wrongAudience = await signToken({ roles: ['user.read'], audience: 'api://someone-else' });
+  // What MCP clients actually send: `aud` = the public MCP URL, not api://.
+  const publicUrlAudience = await signToken({ roles: ['user.read'], audience: PUBLIC_URL });
 
   await check('READ with user.read', async () => {
     const { json } = await callTool(readOnly, 'get_invoices', { organizationId: 4040561 });
     const text = json?.result?.content?.[0]?.text ?? '';
     return `passedGate=${!text.includes('Forbidden')} notAuthError=${json?.error === undefined}`;
+  });
+
+  await check('READ with public-URL audience (accepted)', async () => {
+    const { json } = await callTool(publicUrlAudience, 'get_invoices', { organizationId: 4040561 });
+    const text = json?.result?.content?.[0]?.text ?? '';
+    return `passedGate=${!text.includes('Forbidden')} notAuthError=${json?.error === undefined} raw=${JSON.stringify(json).slice(0, 200)}`;
+  });
+
+  await check('TOOLS/LIST hides write tool from read-only caller', async () => {
+    const names = await listTools(readOnly);
+    return `count=${names.length} hidesWrite=${!names.includes('update_subscription_tags')} showsRead=${names.includes('get_invoices')}`;
+  });
+
+  await check('TOOLS/LIST shows write tool to user.write caller', async () => {
+    const names = await listTools(readWrite);
+    return `count=${names.length} showsWrite=${names.includes('update_subscription_tags')}`;
   });
 
   await check('WRITE with user.read only (denied)', async () => {
@@ -134,6 +172,14 @@ async function main() {
     const { json } = await callTool(noRoles, 'get_invoices', { organizationId: 4040561 });
     const text = json?.result?.content?.[0]?.text ?? '';
     return `isError=${json?.result?.isError} denied=${text.includes("user.read")} raw=${JSON.stringify(json).slice(0, 300)}`;
+  });
+
+  await check('WRITE with user.write but no user.read (denied)', async () => {
+    // user.write does NOT imply user.read — an editor needs both.
+    const writeOnly = await signToken({ roles: ['user.write'] });
+    const { json } = await callTool(writeOnly, 'get_invoices', { organizationId: 4040561 });
+    const text = json?.result?.content?.[0]?.text ?? '';
+    return `isError=${json?.result?.isError} denied=${text.includes('user.read')} raw=${JSON.stringify(json).slice(0, 300)}`;
   });
 
   await check('WRONG AUDIENCE token rejected (401)', async () => {
