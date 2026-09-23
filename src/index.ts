@@ -40,7 +40,7 @@ try {
 
 /** Server name/version advertised to MCP clients and exposed on /health. */
 const SERVER_NAME = 'crayon-cost-mcp';
-const SERVER_VERSION = '1.1.0';
+const SERVER_VERSION = '1.2.0';
 
 // Initialize metrics
 const metrics: AppMetrics = createMetrics();
@@ -95,42 +95,50 @@ async function executeWithCircuitBreaker<T>(apiCall: () => Promise<T>): Promise<
   return circuitBreaker.execute(apiCall);
 }
 
-// Define MCP tools
+// Define MCP tools.
+//
+// Descriptions are written for non-technical business users: they explain the
+// Crayon vocabulary (organization, invoice profile, Azure Plan, provision type)
+// in plain words, give an example question the tool answers, and point to the
+// tool that discovers a required ID. `title` is the short human-readable name
+// clients can display instead of the snake_case tool name.
 const tools: Tool[] = [
   {
     name: 'get_billing_statements',
-    description: 'Get billing statements for an organization with optional filters. Returns monthly billing data including total sales prices and invoice profiles.',
+    title: 'Billing history',
+    description: 'Show the monthly billing statements for an organization — what was billed each month and through which invoice profile. Use this for questions like "what did we spend in total last month?" or "how has the monthly bill changed since January?"',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (required)',
+          description: 'ID of the organization (your Crayon company account). Find it with get_organizations.',
         },
         invoiceProfileId: {
           type: 'number',
-          description: 'Invoice Profile ID (optional)',
+          description: 'Only include one invoice profile (the subscriptions billed together, often a department or contract). Find IDs with get_invoice_profiles.',
         },
         provisionType: {
           type: 'string',
           enum: ['None', 'Seat', 'Usage', 'OneTime', 'Crayon', 'AzureMarketplace'],
-          description: 'Provision type filter (optional)',
+          description: 'Only count one kind of billing: "Seat" (per-user licences), "Usage" (pay-as-you-go consumption), "OneTime" (one-off purchases), "Crayon" (Crayon-managed services) or "AzureMarketplace" (third-party marketplace products). Omit to include everything.',
         },
         from: {
           type: 'string',
-          description: 'Start date in ISO format (optional)',
+          description: 'Only include statements from this date, YYYY-MM-DD (e.g. 2026-01-01).',
         },
         to: {
           type: 'string',
-          description: 'End date in ISO format (optional)',
+          description: 'Only include statements up to this date, YYYY-MM-DD (e.g. 2026-06-30).',
         },
         page: {
           type: 'number',
-          description: 'Page number for pagination (optional)',
+          description: 'Page number to fetch, for large result sets (default: 1).',
         },
         pageSize: {
           type: 'number',
-          description: 'Number of items per page (optional)',
+          description: 'Results per page, 1-500 (default: 100).',
         },
       },
       required: ['organizationId'],
@@ -138,30 +146,32 @@ const tools: Tool[] = [
   },
   {
     name: 'get_grouped_billing_statements',
-    description: 'Get grouped billing statements by billing cycles for an organization. Useful for aggregated cost analysis.',
+    title: 'Billing totals per cycle',
+    description: 'The same billing data as get_billing_statements, grouped per billing cycle so you get one total per month/period instead of row after row. Use it for a quick "how much did we spend each month?" answer.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (required)',
+          description: 'ID of the organization (your Crayon company account). Find it with get_organizations.',
         },
         invoiceProfileId: {
           type: 'number',
-          description: 'Invoice Profile ID (optional)',
+          description: 'Only include one invoice profile (the subscriptions billed together, often a department or contract). Find IDs with get_invoice_profiles.',
         },
         provisionType: {
           type: 'string',
           enum: ['None', 'Seat', 'Usage', 'OneTime', 'Crayon', 'AzureMarketplace'],
-          description: 'Provision type filter (optional)',
+          description: 'Only count one kind of billing: "Seat" (per-user licences), "Usage" (pay-as-you-go consumption), "OneTime" (one-off purchases), "Crayon" (Crayon-managed services) or "AzureMarketplace" (third-party marketplace products). Omit to include everything.',
         },
         from: {
           type: 'string',
-          description: 'Start date in ISO format (optional)',
+          description: 'Only include from this date, YYYY-MM-DD (e.g. 2026-01-01).',
         },
         to: {
           type: 'string',
-          description: 'End date in ISO format (optional)',
+          description: 'Only include up to this date, YYYY-MM-DD (e.g. 2026-06-30).',
         },
       },
       required: ['organizationId'],
@@ -169,29 +179,31 @@ const tools: Tool[] = [
   },
   {
     name: 'get_azure_usage',
-    description: 'Get detailed Azure usage data for a specific subscription and time period. Returns a SAS URI to download CSV file with usage details.',
+    title: 'Download Azure usage details',
+    description: 'Get a temporary, secure download link (SAS URI) to a CSV file with the detailed Azure usage for one Azure subscription in one month — every resource and its measured consumption. Open the link in Excel to drill down. Needs the numeric Azure plan ID and Crayon subscription ID (see get_azure_plan_details and get_azure_plan_subscriptions).',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         azurePlanId: {
           type: 'number',
-          description: 'Azure Plan ID (required)',
+          description: 'ID of the Azure Plan — in Crayon terms the agreement under which a customer buys its Azure consumption. Find it with get_customer_tenants or get_azure_plan_details.',
         },
         subscriptionId: {
           type: 'number',
-          description: 'Azure Subscription ID (required)',
+          description: 'Crayon ID of the subscription (an individual Azure account). Find it with get_azure_plan_subscriptions.',
         },
         year: {
           type: 'number',
-          description: 'Year of usage period (required)',
+          description: 'Year of the usage period (e.g. 2026).',
         },
         month: {
           type: 'number',
-          description: 'Month of usage period (1-12, required)',
+          description: 'Month of the usage period, 1-12 (e.g. 8 for August).',
         },
         includeBom: {
           type: 'boolean',
-          description: 'Include byte-order mark for Excel compatibility (optional)',
+          description: 'Add a byte-order mark so Excel opens the CSV cleanly (recommended for Excel users).',
         },
       },
       required: ['azurePlanId', 'subscriptionId', 'year', 'month'],
@@ -199,21 +211,23 @@ const tools: Tool[] = [
   },
   {
     name: 'get_invoices',
-    description: 'Get invoices for an organization. Returns invoice details including amounts, dates, and status.',
+    title: 'Issued invoices',
+    description: 'List the invoices actually issued to an organization, with amounts, dates and status. Use it for questions like "has the invoice for June arrived, and how much was it?"',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (required)',
+          description: 'ID of the organization (your Crayon company account). Find it with get_organizations.',
         },
         page: {
           type: 'number',
-          description: 'Page number for pagination (optional)',
+          description: 'Page number to fetch, for large result sets (default: 1).',
         },
         pageSize: {
           type: 'number',
-          description: 'Number of items per page (optional)',
+          description: 'Results per page, 1-500 (default: 100).',
         },
       },
       required: ['organizationId'],
@@ -221,13 +235,15 @@ const tools: Tool[] = [
   },
   {
     name: 'get_invoice_profiles',
-    description: 'Get invoice profiles for an organization. Invoice profiles are used to group subscriptions for billing purposes.',
+    title: 'Invoice profiles',
+    description: 'List the invoice profiles of an organization. An invoice profile groups the subscriptions that are billed together — think of it as a section on the invoice, often one department, contract or agreement. Most cost questions are easiest to answer per invoice profile.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (required)',
+          description: 'ID of the organization (your Crayon company account). Find it with get_organizations.',
         },
       },
       required: ['organizationId'],
@@ -235,7 +251,9 @@ const tools: Tool[] = [
   },
   {
     name: 'get_organizations',
-    description: 'List all organizations accessible with current credentials. Use this to discover organization IDs for other queries.',
+    title: 'List organizations',
+    description: 'List every organization (the company account in Crayon that owns the billing) your credentials can see. Always start here when you do not know any IDs — every other tool needs the organization ID this returns.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {},
@@ -243,21 +261,23 @@ const tools: Tool[] = [
   },
   {
     name: 'get_historical_costs',
-    description: 'Get historical billing data over multiple months. Useful for cost trend analysis and forecasting.',
+    title: 'Cost history (monthly)',
+    description: 'Pull the billing history for the last months, one total per month, for an organization. Use it to compare periods, e.g. "compare this quarter with the previous one".',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (required)',
+          description: 'ID of the organization (your Crayon company account). Find it with get_organizations.',
         },
         monthsBack: {
           type: 'number',
-          description: 'Number of months to look back (default: 6, max: 24)',
+          description: 'How many months back to include (default: 6, max: 24).',
         },
         invoiceProfileId: {
           type: 'number',
-          description: 'Invoice Profile ID to filter by (optional)',
+          description: 'Only include one invoice profile (a billing group, often a department or contract). Find IDs with get_invoice_profiles.',
         },
       },
       required: ['organizationId'],
@@ -265,26 +285,30 @@ const tools: Tool[] = [
   },
   {
     name: 'get_customer_tenants',
-    description: 'Get customer tenants (Azure/AWS customers) for resource correlation. Use this to discover tenant IDs for subscription queries.',
+    title: 'List customers',
+    description: 'List the customer tenants — the customer companies (for example a municipality or a business) that the organization manages or bills for. Each customer can have its own Azure Plan. Use it to find the customer tenant ID needed for subscription lookups.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (optional - returns all if omitted)',
+          description: 'Only include customers of one organization (a Crayon company account). Omit to include all organizations you can see.',
         },
       },
     },
   },
   {
     name: 'get_azure_subscriptions',
-    description: 'Get Azure subscriptions for a customer tenant. Use this to correlate costs with specific Azure resources.',
+    title: 'Azure subscriptions for one customer',
+    description: 'List the Azure subscriptions that belong to one customer tenant, resolved through the Azure Plan of that customer. Use it to answer "which Azure subscriptions does this customer have?"',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         customerTenantId: {
           type: 'number',
-          description: 'Customer Tenant ID (required)',
+          description: 'ID of the customer tenant (the customer company). Find it with get_customer_tenants.',
         },
       },
       required: ['customerTenantId'],
@@ -292,42 +316,46 @@ const tools: Tool[] = [
   },
   {
     name: 'get_subscriptions',
-    description: 'Get all cloud subscriptions (Azure, AWS, etc.) to correlate with billing data and resources.',
+    title: 'All cloud subscriptions',
+    description: 'List cloud subscriptions across Azure, AWS and other publishers, with names, statuses and tags. Works for one organization or all of them, so it is the best starting point to identify a subscription by name before digging into its costs.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (optional)',
+          description: 'Only include subscriptions of one organization (a Crayon company account). Omit to include all organizations you can see.',
         },
         page: {
           type: 'number',
-          description: 'Page number for pagination (optional)',
+          description: 'Page number to fetch (when omitted, everything is returned).',
         },
         pageSize: {
           type: 'number',
-          description: 'Number of items per page (optional)',
+          description: 'Results per page, 1-500 (used together with page).',
         },
       },
     },
   },
   {
     name: 'get_cost_by_subscription',
-    description: 'Get detailed cost breakdown by subscription with resource correlation. Combines billing data with subscription details.',
+    title: 'Cost per subscription',
+    description: 'Combine the billing history with the subscription list so costs can be compared side by side per subscription. Use it for "which subscriptions cost the most over the last 3 months?"',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (required)',
+          description: 'ID of the organization (your Crayon company account). Find it with get_organizations.',
         },
         invoiceProfileId: {
           type: 'number',
-          description: 'Invoice Profile ID (optional)',
+          description: 'Only include one invoice profile (a billing group, often a department or contract). Find IDs with get_invoice_profiles.',
         },
         monthsBack: {
           type: 'number',
-          description: 'Number of months to look back (default: 3)',
+          description: 'How many months back to include (default: 3, max: 24).',
         },
       },
       required: ['organizationId'],
@@ -335,13 +363,15 @@ const tools: Tool[] = [
   },
   {
     name: 'get_subscription_details',
-    description: 'Get detailed information about a specific subscription including tags and metadata.',
+    title: 'Subscription details',
+    description: 'Show everything Crayon knows about one subscription: name, offer, status, publisher and its cost-allocation tags. Use it to identify what a subscription actually is before attributing cost to it.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         subscriptionId: {
           type: 'number',
-          description: 'Subscription ID (required)',
+          description: 'Crayon ID of the subscription (an individual Azure or AWS account). Find it with get_subscriptions.',
         },
       },
       required: ['subscriptionId'],
@@ -349,13 +379,15 @@ const tools: Tool[] = [
   },
   {
     name: 'get_subscription_tags',
-    description: 'Get tags for a specific subscription. Tags are used for cost allocation, tracking, and organization.',
+    title: 'Read subscription tags',
+    description: 'Read the cost-allocation tags of one subscription: costCenter, department, project, custom and owner. Use it to check how a subscription is set up for cost tracking, for example before allocating its costs.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         subscriptionId: {
           type: 'number',
-          description: 'Subscription ID (required)',
+          description: 'Crayon ID of the subscription (an individual Azure or AWS account). Find it with get_subscriptions.',
         },
       },
       required: ['subscriptionId'],
@@ -363,17 +395,19 @@ const tools: Tool[] = [
   },
   {
     name: 'update_subscription_tags',
-    description: 'Update or add tags to a subscription for better cost tracking and organization.',
+    title: 'Replace subscription tags',
+    description: 'Set the cost-allocation tags on one subscription: costCenter, department, project, custom and owner. Crayon only accepts these five fields, and the update REPLACES the whole tag set — any field you leave out is cleared, so read the current tags with get_subscription_tags first. Requires the user.write app role.',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         subscriptionId: {
           type: 'number',
-          description: 'Subscription ID (required)',
+          description: 'Crayon ID of the subscription (an individual Azure or AWS account). Find it with get_subscriptions.',
         },
         tags: {
           type: 'object',
-          description: 'Key-value pairs of tags (e.g., {"Environment": "Production", "CostCenter": "IT"})',
+          description: 'The five Crayon tag fields, e.g. {"costCenter": "IT-100", "department": "IT", "project": "Cloud migration", "owner": "anna@example.com"}. Fields you leave out are cleared.',
         },
       },
       required: ['subscriptionId', 'tags'],
@@ -381,13 +415,15 @@ const tools: Tool[] = [
   },
   {
     name: 'get_azure_plan_details',
-    description: 'Get detailed information about an Azure Plan including all associated subscriptions.',
+    title: 'Azure Plan details',
+    description: 'Show the details of one Azure Plan — in Crayon terms the agreement under which a customer buys its modern Azure consumption, identified by a numeric plan ID — including everything attached to it.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         azurePlanId: {
           type: 'number',
-          description: 'Azure Plan ID (required)',
+          description: 'ID of the Azure Plan. Find plan IDs per customer with get_customer_tenants, or via get_azure_plan_subscriptions.',
         },
       },
       required: ['azurePlanId'],
@@ -395,13 +431,15 @@ const tools: Tool[] = [
   },
   {
     name: 'get_azure_plan_subscriptions',
-    description: 'Get all Azure subscriptions associated with an Azure Plan.',
+    title: 'Subscriptions in an Azure Plan',
+    description: 'List all Azure subscriptions under one Azure Plan. Use it to go from a plan ID to the concrete subscriptions that generate usage and cost.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         azurePlanId: {
           type: 'number',
-          description: 'Azure Plan ID (required)',
+          description: 'ID of the Azure Plan. Find plan IDs per customer with get_customer_tenants, or via get_azure_plan_details.',
         },
       },
       required: ['azurePlanId'],
@@ -409,17 +447,19 @@ const tools: Tool[] = [
   },
   {
     name: 'track_costs_by_tags',
-    description: 'Track and analyze costs grouped by subscription tags. Perfect for cost allocation by department, project, or environment.',
+    title: 'Cost by tags over time',
+    description: 'Track costs over the last months grouped by the subscription tags, so spending can be followed per department, project or cost center. Use it for "how much of our spend is the IT department this quarter?"',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (required)',
+          description: 'ID of the organization (your Crayon company account). Find it with get_organizations.',
         },
         monthsBack: {
           type: 'number',
-          description: 'Number of months to analyze (default: 3)',
+          description: 'How many months back to analyze (default: 3, max: 24).',
         },
       },
       required: ['organizationId'],
@@ -427,21 +467,23 @@ const tools: Tool[] = [
   },
   {
     name: 'get_azure_costs_by_date_range',
-    description: 'Get total Azure costs for an organization within a specific date range. Aggregates all Azure subscriptions.',
+    title: 'Azure spend in a period',
+    description: 'Total Azure cost for an organization between two dates, aggregated across all its Azure subscriptions. Use it for "what did Azure cost between March and May?"',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (required)',
+          description: 'ID of the organization (your Crayon company account). Find it with get_organizations.',
         },
         from: {
           type: 'string',
-          description: 'Start date in ISO format YYYY-MM-DD (required)',
+          description: 'Start of the period, YYYY-MM-DD (e.g. 2026-03-01).',
         },
         to: {
           type: 'string',
-          description: 'End date in ISO format YYYY-MM-DD (required)',
+          description: 'End of the period, YYYY-MM-DD (e.g. 2026-05-31).',
         },
       },
       required: ['organizationId', 'from', 'to'],
@@ -449,25 +491,27 @@ const tools: Tool[] = [
   },
   {
     name: 'get_azure_costs_by_subscription',
-    description: 'Get Azure costs for a specific subscription within a date range.',
+    title: 'Azure spend for one subscription',
+    description: 'Azure cost for a single subscription between two dates. Use it to drill into one subscription, for example "what did subscription X cost in August?". Needs the numeric Azure plan ID and Crayon subscription ID (see get_azure_plan_subscriptions).',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         azurePlanId: {
           type: 'number',
-          description: 'Azure Plan ID (required)',
+          description: 'ID of the Azure Plan — in Crayon terms the agreement under which a customer buys its Azure consumption. Find it with get_customer_tenants or get_azure_plan_details.',
         },
         subscriptionId: {
           type: 'number',
-          description: 'Azure Subscription ID (required)',
+          description: 'Crayon ID of the subscription (an individual Azure account). Find it with get_azure_plan_subscriptions.',
         },
         from: {
           type: 'string',
-          description: 'Start date in ISO format YYYY-MM-DD (required)',
+          description: 'Start of the period, YYYY-MM-DD (e.g. 2026-08-01).',
         },
         to: {
           type: 'string',
-          description: 'End date in ISO format YYYY-MM-DD (required)',
+          description: 'End of the period, YYYY-MM-DD (e.g. 2026-08-31).',
         },
       },
       required: ['azurePlanId', 'subscriptionId', 'from', 'to'],
@@ -475,17 +519,19 @@ const tools: Tool[] = [
   },
   {
     name: 'get_cost_trends',
-    description: 'Analyze cost trends over multiple months. Shows month-over-month changes, highest/lowest months, and average costs.',
+    title: 'Cost trend chart',
+    description: 'Analyze how costs moved month by month, and get a line chart plus a short summary (average, highest and lowest month, percent changes). Use it for "is our cloud bill going up?" — good for reports to management.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (required)',
+          description: 'ID of the organization (your Crayon company account). Find it with get_organizations.',
         },
         monthsBack: {
           type: 'number',
-          description: 'Number of months to analyze (default: 6)',
+          description: 'How many months back to analyze (default: 6, max: 24).',
         },
       },
       required: ['organizationId'],
@@ -493,21 +539,23 @@ const tools: Tool[] = [
   },
   {
     name: 'detect_cost_anomalies',
-    description: 'Detect subscriptions with significant cost changes. Identifies what changed and by how much, useful for finding unexpected costs.',
+    title: 'Find cost spikes',
+    description: 'Detect subscriptions whose cost changed significantly from one month to the next, and show what changed and by how much. Use it for "why did the bill jump last month?" or to catch surprises before the invoice arrives.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (required)',
+          description: 'ID of the organization (your Crayon company account). Find it with get_organizations.',
         },
         monthsBack: {
           type: 'number',
-          description: 'Number of months to analyze (default: 3)',
+          description: 'How many months back to analyze (default: 3, max: 24).',
         },
         changeThresholdPercent: {
           type: 'number',
-          description: 'Percentage threshold to flag as anomaly (default: 25)',
+          description: 'How big a month-over-month change (in percent) counts as an anomaly (default: 25).',
         },
       },
       required: ['organizationId'],
@@ -515,17 +563,19 @@ const tools: Tool[] = [
   },
   {
     name: 'analyze_costs_by_tags',
-    description: 'Analyze and breakdown costs by tags (CostCenter, Department, Project, etc.). Shows total cost per tag value.',
+    title: 'Cost split by tag',
+    description: 'Break costs down per tag value (costCenter, department, project, owner) for a period, showing the total per value. Use it for "how much did each department spend?" when tags are maintained.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (required)',
+          description: 'ID of the organization (your Crayon company account). Find it with get_organizations.',
         },
         monthsBack: {
           type: 'number',
-          description: 'Number of months to analyze (default: 3)',
+          description: 'How many months back to analyze (default: 3, max: 24).',
         },
       },
       required: ['organizationId'],
@@ -533,17 +583,19 @@ const tools: Tool[] = [
   },
   {
     name: 'find_similar_subscriptions_and_invoices',
-    description: 'Find subscriptions matching a name pattern (e.g., "sub-prod-*") and get their latest invoices. Useful for finding related resources.',
+    title: 'Find subscriptions by name',
+    description: 'Find subscriptions whose name matches a text pattern and fetch their latest invoices. Use it to gather related subscriptions, e.g. all production ones (pattern "sub-prod.*") or everything for one customer (pattern "viken.*").',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (required)',
+          description: 'ID of the organization (your Crayon company account). Find it with get_organizations.',
         },
         namePattern: {
           type: 'string',
-          description: 'Subscription name pattern (regex, case-insensitive). Examples: "sub-prod.*", ".*-prod", "viken.*"',
+          description: 'Text the subscription name should match (regex, case-insensitive, max 100 chars). Examples: "sub-prod.*", ".*-prod", "viken.*".',
         },
       },
       required: ['organizationId', 'namePattern'],
@@ -551,13 +603,15 @@ const tools: Tool[] = [
   },
   {
     name: 'list_all_subscriptions_with_tags',
-    description: 'List all subscriptions with their complete tag information. Useful for auditing and verification of tagging accuracy.',
+    title: 'Audit subscription tags',
+    description: 'List every subscription with its full tag set (costCenter, department, project, custom, owner). Use it to audit tagging accuracy — for example to find subscriptions missing a cost center before running a cost-by-tag report.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (optional - returns all if omitted)',
+          description: 'Only include subscriptions of one organization (a Crayon company account). Omit to include all organizations you can see.',
         },
       },
       required: [],
@@ -565,13 +619,15 @@ const tools: Tool[] = [
   },
   {
     name: 'get_last_month_costs_by_organization',
-    description: 'Get total costs for last month broken down by organization.',
+    title: 'Last month total',
+    description: 'Total cost for last month for one organization. The quickest answer to "what did we spend last month?"',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (required)',
+          description: 'ID of the organization (your Crayon company account). Find it with get_organizations.',
         },
       },
       required: ['organizationId'],
@@ -579,13 +635,15 @@ const tools: Tool[] = [
   },
   {
     name: 'get_last_month_costs_by_invoice_profile',
-    description: 'Get last month costs broken down by invoice profile. Shows which profile generated the most cost.',
+    title: 'Last month per billing group',
+    description: 'Last month costs split per invoice profile (the billing groups, often departments or contracts), so you can see which one generated the most cost. Use it for "which part of the company drove the bill last month?"',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (required)',
+          description: 'ID of the organization (your Crayon company account). Find it with get_organizations.',
         },
       },
       required: ['organizationId'],
@@ -593,13 +651,15 @@ const tools: Tool[] = [
   },
   {
     name: 'get_last_month_costs_by_tags',
-    description: 'Get last month costs broken down by tags (CostCenter, Department, Project, etc.). Shows which tag values had the most cost.',
+    title: 'Last month per tag',
+    description: 'Last month costs split per tag value (costCenter, department, project, owner). Use it for "how did last month split across departments/projects?" — requires that tags are maintained.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (required)',
+          description: 'ID of the organization (your Crayon company account). Find it with get_organizations.',
         },
       },
       required: ['organizationId'],
@@ -607,26 +667,28 @@ const tools: Tool[] = [
   },
   {
     name: 'visualize_costs_pie_chart',
-    description: 'Generate a pie or doughnut chart showing the cost distribution across the top subscriptions for the last N months.',
+    title: 'Cost distribution chart',
+    description: 'Generate a pie or doughnut chart image showing how cost is distributed across the biggest invoice profiles, with the numbers listed next to it. Use it when a picture is wanted, e.g. for a slide or a status update.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (required)',
+          description: 'ID of the organization (your Crayon company account). Find it with get_organizations.',
         },
         monthsBack: {
           type: 'number',
-          description: 'Number of months to analyze (default: 3)',
+          description: 'How many months to include (default: 3, max: 24).',
         },
         topN: {
           type: 'number',
-          description: 'Number of top subscriptions to include (default: 10, max: 50)',
+          description: 'How many of the largest profiles to show (default: 10, max: 50).',
         },
         chartStyle: {
           type: 'string',
           enum: ['pie', 'doughnut'],
-          description: 'Chart style (default: pie)',
+          description: 'Chart style: "pie" (filled circle) or "doughnut" (with a hole). Default: pie.',
         },
       },
       required: ['organizationId'],
@@ -634,29 +696,31 @@ const tools: Tool[] = [
   },
   {
     name: 'get_aws_accounts',
-    description: 'List AWS accounts managed through Crayon, with their embedded tags, payer account, master-account status and AWS segment.',
+    title: 'AWS accounts',
+    description: 'List AWS accounts managed through Crayon — the AWS equivalent of an Azure subscription — with their tags, payer account and status. Use it to see which AWS accounts exist and how they are tagged, optionally filtered by organization, customer or free-text search.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (optional - returns all accessible if omitted)',
+          description: 'Only include accounts of one organization (a Crayon company account). Omit to include all organizations you can see.',
         },
         customerTenantId: {
           type: 'number',
-          description: 'Customer tenant ID to filter by (optional)',
+          description: 'Only include accounts of one customer tenant (the customer company). Find it with get_customer_tenants.',
         },
         search: {
           type: 'string',
-          description: 'Free-text search filter (optional)',
+          description: 'Free-text search, for example an account name (max 100 characters).',
         },
         page: {
           type: 'number',
-          description: 'Page number for pagination (optional)',
+          description: 'Page number to fetch (default: 1).',
         },
         pageSize: {
           type: 'number',
-          description: 'Number of items per page (optional, default 100)',
+          description: 'Results per page, 1-500 (default: 100).',
         },
       },
       required: [],
@@ -664,13 +728,15 @@ const tools: Tool[] = [
   },
   {
     name: 'get_aws_account_details',
-    description: 'Get a single AWS account by its Crayon account ID, including tags and activation state.',
+    title: 'AWS account details',
+    description: 'Show everything Crayon knows about one AWS account: name, payer account, activation state and its cost-allocation tags. Use it to identify what an AWS account is before attributing cost to it.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         accountId: {
           type: 'number',
-          description: 'Crayon AWS account ID (required)',
+          description: 'Crayon ID of the AWS account. Find it with get_aws_accounts.',
         },
       },
       required: ['accountId'],
@@ -678,13 +744,15 @@ const tools: Tool[] = [
   },
   {
     name: 'get_spend_by_cloud_provider',
-    description: 'Summarise spend and subscription counts per cloud publisher (Microsoft/Azure, AWS, etc.) and list AWS accounts. Use this for a multi-cloud overview.',
+    title: 'Azure vs AWS overview',
+    description: 'Summarize spend and subscription counts per cloud provider (Microsoft Azure, AWS, and others) for an organization, so you can compare clouds side by side. Use it for "how much do we spend on Azure versus AWS?"',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         organizationId: {
           type: 'number',
-          description: 'Organization ID (required)',
+          description: 'ID of the organization (your Crayon company account). Find it with get_organizations.',
         },
       },
       required: ['organizationId'],
@@ -696,6 +764,31 @@ const tools: Tool[] = [
 //
 // The handler invokes this once per HTTP request, so request-scoped state must
 // live inside the factory rather than at module scope.
+//
+// `instructions` is a Crayon-vocabulary glossary returned to clients at the
+// initialize handshake. It teaches non-technical callers how the Crayon terms
+// map to everyday questions, so the model picks the right tool and the right
+// ID chain (organization -> invoice profile / customer tenant -> Azure Plan ->
+// subscription) without guesswork.
+const SERVER_INSTRUCTIONS = `
+This server answers cost and billing questions about Crayon-managed cloud (Azure, AWS and other publishers).
+
+Crayon vocabulary, in plain words:
+- organization: the company account in Crayon that owns the billing. Every query needs its numeric ID; discover it with get_organizations.
+- invoice profile: a group of subscriptions that are billed together — like a section on the invoice, often one department, contract or agreement. Discover with get_invoice_profiles.
+- customer tenant: the customer company that is billed, e.g. a municipality or business. Discover with get_customer_tenants.
+- Azure Plan: the agreement under which a customer buys its modern Azure consumption; identified by a numeric plan ID. Discover per customer with get_customer_tenants, and inspect with get_azure_plan_details / get_azure_plan_subscriptions.
+- subscription: one Azure or AWS account that generates usage and cost. Discover with get_subscriptions or get_azure_plan_subscriptions.
+- tags: the cost-allocation fields on a subscription (costCenter, department, project, custom, owner). Crayon only supports these five; update_subscription_tags REPLACES the whole set, so read tags first with get_subscription_tags.
+- provision type: the kind of billing — Seat (per-user licences), Usage (pay-as-you-go), OneTime (one-off purchases), Crayon (Crayon-managed services) or AzureMarketplace (third-party marketplace products).
+
+Typical chains:
+- "What did we spend last month?" -> get_organizations, then get_last_month_costs_by_organization.
+- Cost split per department/contract -> use the ..._by_invoice_profile or ..._by_tags tools.
+- Cost for one Azure subscription -> get_customer_tenants (plan IDs), get_azure_plan_subscriptions, then get_azure_costs_by_subscription or get_azure_usage.
+- All dates are YYYY-MM-DD. Money is returned as a Price object with value and currencyCode.
+`.trim();
+
 function createServer(): Server {
   const server = new Server(
     {
@@ -706,6 +799,7 @@ function createServer(): Server {
       capabilities: {
         tools: {},
       },
+      instructions: SERVER_INSTRUCTIONS,
     }
   );
 
