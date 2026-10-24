@@ -23,9 +23,9 @@ const recorded = [];
 
 /** Spec-shaped fixtures: bare arrays, camelCase fields, Price objects. */
 const fixtures = {
-  '/Organizations': [{ id: 1234567, name: 'Example Cloud AS', accountNumber: 'A1' }],
+  '/Organizations': [{ id: 1000001, name: 'Example Corp', accountNumber: 'A1' }],
   '/CustomerTenants': [{ id: 7, name: 'Tenant A', domain: 'a.example' }],
-  '/CustomerTenants/7/azurePlan': { id: 100, name: 'Azure Plan', organization: { id: 1234567, name: 'Example Cloud AS' } },
+  '/CustomerTenants/7/azurePlan': { id: 100, name: 'Azure Plan', organization: { id: 1000001, name: 'Example Corp' } },
   '/AzurePlans/100': { id: 100, name: 'Azure Plan' },
   '/AzurePlans/100/azureSubscriptions': [
     { id: 500, azurePlanId: 100, friendlyName: 'Sub A', tags: { costCenter: 'IT' } },
@@ -34,7 +34,7 @@ const fixtures = {
     {
       id: 1, name: 'Sub A', orderId: 'O1', salesPrice: 100, status: 'Active',
       publisher: { id: 1, name: 'Microsoft' },
-      organization: { id: 1234567, name: 'Example Cloud AS' },
+      organization: { id: 1000001, name: 'Example Corp' },
       startDate: '2025-01-01T00:00:00+00:00', endDate: '2026-01-01T00:00:00+00:00',
       subscriptionTags: { costCenter: 'IT', department: 'Platform' },
     },
@@ -45,17 +45,17 @@ const fixtures = {
     { id: 1, orderId: 'O1', totalSalesPrice: { value: 100, currencyCode: 'NOK' }, invoiceProfile: { id: 1, name: 'Profile A' }, startDate: '2025-08-01T00:00:00+00:00' },
   ],
   '/BillingStatements/grouped': [
-    { id: 1, groupId: 1, orderId: 'O1', totalSalesPrice: { value: 100, currencyCode: 'NOK' }, invoiceProfile: { id: 1, name: 'Profile A' }, organization: { id: 1234567, name: 'Example Cloud AS' }, startDate: '2025-08-01T00:00:00+00:00', endDate: '2025-09-01T00:00:00+00:00' },
+    { id: 1, groupId: 1, orderId: 'O1', totalSalesPrice: { value: 100, currencyCode: 'NOK' }, invoiceProfile: { id: 1, name: 'Profile A' }, organization: { id: 1000001, name: 'Example Corp' }, startDate: '2025-08-01T00:00:00+00:00', endDate: '2025-09-01T00:00:00+00:00' },
   ],
-  '/Invoices/1234567': [
+  '/Invoices/1000001': [
     { invoiceId: 'I1', orderId: 'O1', salesAmount: 100, salesCurrencyCode: 'NOK', invoiceDate: '2025-09-01T00:00:00+00:00' },
   ],
-  '/InvoiceProfiles': [{ id: 1, name: 'Profile A', organization: { id: 1234567, name: 'Example Cloud AS' } }],
+  '/InvoiceProfiles': [{ id: 1, name: 'Profile A', organization: { id: 1000001, name: 'Example Corp' } }],
   '/AwsAccounts': [
     { id: 9, name: 'AWS Acct', awsAccountName: 'aws-acct', isActivated: true, payerAccountId: 'P1', masterAccountStatus: 'Active', awsSegment: 'Commercial', tags: { costCenter: 'IT' } },
   ],
   '/AwsAccounts/9': { id: 9, name: 'AWS Acct', isActivated: true, tags: {} },
-  '/UsageCost/organization/1234567': [
+  '/UsageCost/organization/1000001': [
     { supplier: 'azure', accountId: 'A1', accountName: 'Acct', subscriptionName: 'Sub A', subscriptionId: '1', amount: 100, currencyCode: 'NOK' },
   ],
 };
@@ -130,8 +130,8 @@ const child = spawn(process.execPath, ['dist/index.js'], {
     HOST: '127.0.0.1',
     AUTH_MODE: 'token',
     AUTH_TOKEN: TOKEN,
-    ALLOWED_ORGANIZATIONS: '1234567',
-    ALLOWED_WRITE_ORGANIZATIONS: '1234567',
+    ALLOWED_ORGANIZATIONS: '1000001',
+    ALLOWED_WRITE_ORGANIZATIONS: '1000001',
     CRAYON_API_BASE_URL: `${MOCK_BASE}/api/v1`,
     CRAYON_CLIENT_ID: 'dummy',
     CRAYON_CLIENT_SECRET: 'dummy',
@@ -177,37 +177,37 @@ async function rpc(id, method, params, name) {
 
 // Arguments for every tool. Mutating/write tool included.
 const TOOL_ARGS = {
-  analyze_costs_by_tags: { organizationId: 1234567, monthsBack: 3 },
-  detect_cost_anomalies: { organizationId: 1234567, monthsBack: 3, thresholdPercent: 25 },
-  find_similar_subscriptions_and_invoices: { organizationId: 1234567, namePattern: 'Sub' },
+  analyze_costs_by_tags: { organizationId: 1000001, monthsBack: 3 },
+  detect_cost_anomalies: { organizationId: 1000001, monthsBack: 3, thresholdPercent: 25 },
+  find_similar_subscriptions_and_invoices: { organizationId: 1000001, namePattern: 'Sub' },
   get_aws_account_details: { accountId: 9 },
-  get_aws_accounts: { organizationId: 1234567 },
-  get_azure_costs_by_date_range: { organizationId: 1234567, from: '2025-08-01', to: '2025-09-01' },
+  get_aws_accounts: { organizationId: 1000001 },
+  get_azure_costs_by_date_range: { organizationId: 1000001, from: '2025-08-01', to: '2025-09-01' },
   get_azure_costs_by_subscription: { azurePlanId: 100, subscriptionId: 500, from: '2025-08-01', to: '2025-09-01' },
   get_azure_plan_details: { azurePlanId: 100 },
   get_azure_plan_subscriptions: { azurePlanId: 100 },
   get_azure_subscriptions: { customerTenantId: 7 },
   get_azure_usage: { azurePlanId: 100, subscriptionId: 500, year: 2025, month: 8 },
-  get_billing_statements: { organizationId: 1234567 },
-  get_cost_by_subscription: { organizationId: 1234567, monthsBack: 3 },
-  get_cost_trends: { organizationId: 1234567, monthsBack: 3 },
-  get_customer_tenants: { organizationId: 1234567 },
-  get_grouped_billing_statements: { organizationId: 1234567 },
-  get_historical_costs: { organizationId: 1234567, monthsBack: 3 },
-  get_invoice_profiles: { organizationId: 1234567 },
-  get_invoices: { organizationId: 1234567 },
-  get_last_month_costs_by_invoice_profile: { organizationId: 1234567 },
-  get_last_month_costs_by_organization: { organizationId: 1234567 },
-  get_last_month_costs_by_tags: { organizationId: 1234567 },
+  get_billing_statements: { organizationId: 1000001 },
+  get_cost_by_subscription: { organizationId: 1000001, monthsBack: 3 },
+  get_cost_trends: { organizationId: 1000001, monthsBack: 3 },
+  get_customer_tenants: { organizationId: 1000001 },
+  get_grouped_billing_statements: { organizationId: 1000001 },
+  get_historical_costs: { organizationId: 1000001, monthsBack: 3 },
+  get_invoice_profiles: { organizationId: 1000001 },
+  get_invoices: { organizationId: 1000001 },
+  get_last_month_costs_by_invoice_profile: { organizationId: 1000001 },
+  get_last_month_costs_by_organization: { organizationId: 1000001 },
+  get_last_month_costs_by_tags: { organizationId: 1000001 },
   get_organizations: {},
-  get_spend_by_cloud_provider: { organizationId: 1234567 },
+  get_spend_by_cloud_provider: { organizationId: 1000001 },
   get_subscription_details: { subscriptionId: 1 },
   get_subscription_tags: { subscriptionId: 1 },
-  get_subscriptions: { organizationId: 1234567 },
-  list_all_subscriptions_with_tags: { organizationId: 1234567 },
-  track_costs_by_tags: { organizationId: 1234567, monthsBack: 3 },
+  get_subscriptions: { organizationId: 1000001 },
+  list_all_subscriptions_with_tags: { organizationId: 1000001 },
+  track_costs_by_tags: { organizationId: 1000001, monthsBack: 3 },
   update_subscription_tags: { subscriptionId: 1, tags: { costCenter: 'IT', department: 'Platform' } },
-  visualize_costs_pie_chart: { organizationId: 1234567, monthsBack: 3, topN: 5 },
+  visualize_costs_pie_chart: { organizationId: 1000001, monthsBack: 3, topN: 5 },
 };
 
 // ---------------------------------------------------------------------------

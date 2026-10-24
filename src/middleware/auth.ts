@@ -28,11 +28,20 @@ import { resolveConfig, type AppConfig } from '../utils/config.js';
  */
 const config: AppConfig = resolveConfig();
 
-// Allowed organizations (comma-separated IDs, e.g. "1234567,7654321").
+// Allowed organizations (comma-separated IDs, e.g. "1000001,1000002").
 const ALLOWED_ORGANIZATIONS = config.allowedOrganizations;
 
-if (ALLOWED_ORGANIZATIONS.length === 0 && config.authMode !== 'none') {
-  console.warn('WARNING: ALLOWED_ORGANIZATIONS not set. Access will be restricted.');
+// An empty allowlist is treated as "no organization is permitted" unless the
+// operator deliberately opts into unrestricted access. The opposite default
+// (empty = everything) is fail-open: a missing environment variable would expose
+// every customer's cost data without changing a single line of code.
+const ALLOW_ANY_ORGANIZATION = config.allowAllOrganizations;
+
+if (ALLOWED_ORGANIZATIONS.length === 0 && !ALLOW_ANY_ORGANIZATION && config.authMode !== 'none') {
+  console.warn(
+    'WARNING: ALLOWED_ORGANIZATIONS not set. Every organization-scoped tool call will be denied. ' +
+      'Set the allowlist, or ALLOW_ALL_ORGANIZATIONS=true to allow all organizations deliberately.'
+  );
 }
 
 /** App role names as they appear in the token's `roles` claim. */
@@ -301,7 +310,8 @@ function authenticateWithEntra(req: Request, res: Response, next: NextFunction, 
  * Authentication middleware — validates the caller token per `AUTH_MODE`.
  */
 export function authenticateRequest(req: Request, res: Response, next: NextFunction): void {
-  // Development bypass. Unreachable unless explicitly configured.
+  // Development bypass. Unreachable unless explicitly configured, and refused
+  // outright in production by loadConfig().
   if (config.authMode === 'none') {
     setDevelopmentIdentity(req);
     return next();
@@ -309,23 +319,18 @@ export function authenticateRequest(req: Request, res: Response, next: NextFunct
 
   const token = extractToken(req);
 
-  // MCP clients probe the endpoint before they hold a token, so let the
-  // initialize handshake through anonymously to keep discovery working. Every
-  // tool call still requires a token, and write tools require `user.write`.
+  // No token: answer 401 with a Bearer challenge. MCP clients use that challenge
+  // (and the protected-resource metadata it points at) to discover how to
+  // authenticate, so no method — including `initialize` — is served anonymously.
+  // An anonymous handshake used to be allowed here for discovery, which handed
+  // unauthenticated callers a server instance and bypassed the credential
+  // dance the protocol defines.
   if (!token) {
-    if (req.method === 'POST' && req.body?.method === 'initialize') {
-      setAuthenticatedIdentity(req, {
-        id: 'anonymous',
-        email: 'anonymous@crayon-cost-mcp.local',
-        roles: [],
-        scopes: [],
-        token: '',
-      });
-      return next();
-    }
-
-    logger.error('Authentication failed: Missing authorization header');
-    res.status(401).json({ error: 'Unauthorized: Missing authorization header' });
+    logger.error('Authentication failed: Missing authorization header', { path: req.path });
+    res
+      .status(401)
+      .setHeader('WWW-Authenticate', 'Bearer realm="crayon-cost-mcp"')
+      .json({ error: 'Unauthorized: Missing authorization header' });
     return;
   }
 
@@ -352,11 +357,29 @@ export interface ToolPolicy {
   role: string;
   /** True when the tool mutates remote state. */
   mutation: boolean;
+  /**
+   * True when the tool targets no single organization (it aggregates across all
+   * of them, or reads a global catalogue). Such a tool must NOT be reachable
+   * with an empty allowlist, because the organization allowlist is what scopes
+   * it — a per-organization check has nothing to compare against.
+   */
+  crossOrganization?: boolean;
 }
 
 const TOOL_POLICIES: Record<string, ToolPolicy> = Object.freeze({
   // Mutating tools (Crayon PUT/POST/DELETE).
   update_subscription_tags: { role: APP_ROLE_WRITE, mutation: true },
+
+  // Tools whose `organizationId` is OPTIONAL. Omitting it does not scope the
+  // query to one organization — the Crayon API then returns every organization
+  // the service credential can see. The per-organization allowlist check has
+  // nothing to compare against in that case, so these are flagged explicitly and
+  // refused when no organization is supplied unless the operator opted into
+  // cross-organization access.
+  get_subscriptions: { role: APP_ROLE_READ, mutation: false, crossOrganization: true },
+  get_customer_tenants: { role: APP_ROLE_READ, mutation: false, crossOrganization: true },
+  get_aws_accounts: { role: APP_ROLE_READ, mutation: false, crossOrganization: true },
+  list_all_subscriptions_with_tags: { role: APP_ROLE_READ, mutation: false, crossOrganization: true },
 });
 
 /** Conservative default for tools with no explicit policy. */
@@ -478,11 +501,30 @@ export function enforceToolPolicy(
 
   // Organization-scoped checks only apply when the tool targets one.
   if (organizationId == null) {
+    // A cross-organization tool with no organization is an unscoped read of every
+    // customer the service credential can see. Refuse unless that breadth is
+    // explicitly configured — otherwise forgetting `organizationId` would turn
+    // any read tool into an all-organizations query.
+    if (policy.crossOrganization && !ALLOW_ANY_ORGANIZATION) {
+      log('Authorization failed: cross-organization read without an organization', {
+        tool: toolName,
+        userId: caller.id,
+        operation,
+      });
+      return deny(
+        toolName,
+        `Forbidden: '${toolName}' requires an organizationId. Passing one is how your access is scoped to an allowed organization.`,
+        { requiredArgument: 'organizationId' }
+      );
+    }
     return null;
   }
 
   // 2. Organization allowlist
-  if (ALLOWED_ORGANIZATIONS.length > 0 && !ALLOWED_ORGANIZATIONS.includes(organizationId)) {
+  //
+  // Fail closed: with an empty allowlist and no explicit ALLOW_ALL_ORGANIZATIONS
+  // opt-in, no organization is reachable. See the note at the top of this file.
+  if (!ALLOW_ANY_ORGANIZATION && !ALLOWED_ORGANIZATIONS.includes(organizationId)) {
     log('Authorization failed: organization not allowed', {
       tool: toolName,
       userId: caller.id,
@@ -511,4 +553,56 @@ export function enforceToolPolicy(
   }
 
   return null;
+}
+
+/**
+ * Restricts a list of Crayon organizations to the ones the caller may read.
+ *
+ * `get_organizations` is the discovery tool that reveals the IDs every other
+ * tool needs, and it takes no `organizationId` — so the per-organization
+ * allowlist has nothing to gate. Without this filter a caller scoped to a single
+ * organization could still enumerate the name and ID of every customer the
+ * service credential can see. Entries without a usable numeric id are dropped
+ * rather than kept, because they cannot be checked against the allowlist.
+ */
+export function filterReadableOrganizations<T>(organizations: T[]): T[] {
+  if (ALLOW_ANY_ORGANIZATION) return organizations;
+  return organizations.filter((organization) => {
+    const id = (organization as { id?: unknown } | null)?.id;
+    const numericId = typeof id === 'number' ? id : Number(id);
+    return Number.isFinite(numericId) && ALLOWED_ORGANIZATIONS.includes(numericId);
+  });
+}
+
+/**
+ * Route guard requiring the read app role.
+ *
+ * Used for endpoints that expose operational state rather than cost data
+ * (`GET /metrics`). Authenticating is not the same as being entitled: any valid
+ * token issued by the tenant — including one minted for an unrelated application
+ * — passes `authenticateRequest`, so each protected route must still state the
+ * role it requires.
+ */
+export function requireReadRole(req: Request, res: Response, next: NextFunction): void {
+  if (config.authMode === 'none') {
+    next();
+    return;
+  }
+
+  const roles = req.auth?.extra?.roles;
+  const held = Array.isArray(roles) ? roles.filter((r): r is string => typeof r === 'string') : [];
+
+  if (!held.includes(APP_ROLE_READ)) {
+    logger.error('Authorization failed: route requires app role', {
+      path: req.path,
+      requiredRole: APP_ROLE_READ,
+      heldRoles: held,
+    });
+    res
+      .status(403)
+      .json({ error: `Forbidden: this endpoint requires the '${APP_ROLE_READ}' app role` });
+    return;
+  }
+
+  next();
 }

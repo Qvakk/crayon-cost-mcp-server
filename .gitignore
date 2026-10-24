@@ -1,11 +1,21 @@
-# Environment variables
+# Environment variables — every .env variant, at any depth, is ignored except
+# the documented template. A single-file rule (.env / .env.local) is not enough:
+# `.env.production`, `.env.staging` and `.env.bak` all carry live secrets and
+# would otherwise be committed by a plain `git add -A`.
 .env
-.env.local
-.env.*.local
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
 
 # Dependencies
 node_modules/
-package-lock.json
+
+# NOTE: package-lock.json is deliberately COMMITTED. It pins every transitive
+# version and carries integrity hashes, so builds are reproducible and npm can
+# verify what it downloads. Without it `npm install` resolves the newest matching
+# version at build time, which is a supply-chain risk on a public repository.
 
 # Build output
 dist/

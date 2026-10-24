@@ -15,7 +15,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { CrayonApiClient, priceValue, priceCurrency } from './crayon-client.js';
 import { logger, logToolExecution, logSecurityEvent } from './middleware/logger.js';
-import { authenticateRequest, callerFromAuthInfo, canInvokeTool, enforceToolPolicy } from './middleware/auth.js';
+import { authenticateRequest, callerFromAuthInfo, canInvokeTool, enforceToolPolicy, filterReadableOrganizations, requireReadRole } from './middleware/auth.js';
 import { validateToolInput } from './middleware/validation.js';
 import { sanitizeErrorMessage, createCircuitBreakerWrapper } from './middleware/security.js';
 import { chartGenerator } from './utils/chart-generator.js';
@@ -584,7 +584,7 @@ const tools: Tool[] = [
   {
     name: 'find_similar_subscriptions_and_invoices',
     title: 'Find subscriptions by name',
-    description: 'Find subscriptions whose name matches a text pattern and fetch their latest invoices. Use it to gather related subscriptions, e.g. all production ones (pattern "sub-prod.*") or everything for one customer (pattern "customer.*").',
+    description: 'Find subscriptions whose name matches a text pattern and fetch their latest invoices. Use it to gather related subscriptions, e.g. all production ones (pattern "sub-prod.*") or everything for one customer (pattern "contoso.*").',
     annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
@@ -595,7 +595,7 @@ const tools: Tool[] = [
         },
         namePattern: {
           type: 'string',
-          description: 'Text the subscription name should match (regex, case-insensitive, max 100 chars). Examples: "sub-prod.*", ".*-prod", "customer.*".',
+          description: 'Text the subscription name should match (regex, case-insensitive, max 100 chars). Examples: "sub-prod.*", ".*-prod", "contoso.*".',
         },
       },
       required: ['organizationId', 'namePattern'],
@@ -945,6 +945,10 @@ function createServer(): Server {
           const result = await executeWithCircuitBreaker(
             () => crayonClient.getOrganizations()
           );
+          // The catalogue is filtered to the allowlist: this tool takes no
+          // organizationId, so the per-organization gate has nothing to check,
+          // and an unfiltered response discloses every customer's name and ID.
+          const organizations = filterReadableOrganizations(result);
           const duration = Date.now() - startTime;
           logToolExecution({
             tool: name,
@@ -953,7 +957,7 @@ function createServer(): Server {
             duration,
             status: 'success',
           });
-          return createToolResponse(result);
+          return createToolResponse({ count: organizations.length, organizations });
         }
 
         case 'get_historical_costs': {
@@ -1405,6 +1409,14 @@ async function startServer(): Promise<void> {
   // OWASP Security: A05:2021 - Security Misconfiguration
   app.disable('x-powered-by'); // Hide Express fingerprint
 
+  // Trust exactly the configured number of proxy hops so `req.ip` and the rate
+  // limiter see the real client instead of the ingress. Without this every
+  // caller shares one rate-limit bucket; with `true` a caller could spoof its
+  // address via X-Forwarded-For. `0` means "no proxy, trust the socket".
+  if (config.trustProxy > 0) {
+    app.set('trust proxy', config.trustProxy);
+  }
+
   // Helmet for comprehensive security headers
   app.use(helmet({
     contentSecurityPolicy: {
@@ -1458,6 +1470,21 @@ async function startServer(): Promise<void> {
     next();
   });
 
+  // Authentication must be registered BEFORE the routes it protects.
+  //
+  // Express dispatches in registration order, so a route declared above this
+  // line would be served before the middleware ever ran. `GET /metrics` used to
+  // be registered first and was therefore reachable unauthenticated despite the
+  // middleware below it — a real bypass, since the payload exposes tool usage
+  // and circuit-breaker state.
+  if (config.authMode !== 'none') {
+    app.use('/mcp', authenticateRequest);
+    // /metrics exposes operational state (tool usage, circuit-breaker trips),
+    // not cost data, so it is gated on authentication plus the read role rather
+    // than on an organization allowlist.
+    app.use('/metrics', authenticateRequest, requireReadRole);
+  }
+
   // Health check endpoint (no auth required)
   app.get('/health', (_req: Request, res: Response) => {
     const uptime = Date.now() - metrics.startTime;
@@ -1487,10 +1514,7 @@ async function startServer(): Promise<void> {
   });
 
   // Apply authentication middleware to /mcp and /metrics endpoints
-  if (config.authMode !== 'none') {
-    app.use('/mcp', authenticateRequest);
-    app.use('/metrics', authenticateRequest);
-  }
+  // (registered above their routes — see the note there).
 
   // MCP Streamable HTTP endpoint.
   //
@@ -1513,6 +1537,37 @@ async function startServer(): Promise<void> {
         });
       }
     }
+  });
+
+  // Terminal error handler.
+  //
+  // Express's default handler reflects the request path in an HTML body and, in
+  // development mode, includes the stack. A malformed JSON body would therefore
+  // answer an MCP client with an HTML page containing internals. Answer every
+  // unhandled error with the JSON-RPC error shape and no detail instead.
+  app.use((error: Error, req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) {
+      next(error);
+      return;
+    }
+    const status = (error as { status?: number; statusCode?: number }).status
+      ?? (error as { statusCode?: number }).statusCode
+      ?? 500;
+    // Client errors (bad JSON, payload too large) are logged without a stack;
+    // unexpected failures keep the stack in the log only.
+    logger.error('Unhandled request error', {
+      path: req.path,
+      method: req.method,
+      status,
+      errorMessage: error.message,
+      stack: status >= 500 ? error.stack : undefined,
+    });
+    metrics.errorCount++;
+    res.status(status).json({
+      jsonrpc: '2.0',
+      error: { code: -32700, message: status === 413 ? 'Request body too large' : 'Invalid request' },
+      id: null,
+    });
   });
 
   httpServer = app.listen(config.port, config.host, () => {

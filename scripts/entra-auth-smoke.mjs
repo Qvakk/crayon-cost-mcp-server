@@ -60,8 +60,8 @@ const child = spawn(process.execPath, ['dist/index.js'], {
     ENTRA_AUDIENCES: `${AUDIENCE} ${PUBLIC_URL}`,
     ENTRA_READ_ROLE: 'user.read',
     ENTRA_WRITE_ROLE: 'user.write',
-    ALLOWED_ORGANIZATIONS: '1234567',
-    ALLOWED_WRITE_ORGANIZATIONS: '1234567',
+    ALLOWED_ORGANIZATIONS: '1000001',
+    ALLOWED_WRITE_ORGANIZATIONS: '1000001',
     CRAYON_CLIENT_ID: 'dummy',
     CRAYON_CLIENT_SECRET: 'dummy',
     CRAYON_USERNAME: 'dummy',
@@ -135,13 +135,13 @@ async function main() {
   const publicUrlAudience = await signToken({ roles: ['user.read'], audience: PUBLIC_URL });
 
   await check('READ with user.read', async () => {
-    const { json } = await callTool(readOnly, 'get_invoices', { organizationId: 1234567 });
+    const { json } = await callTool(readOnly, 'get_invoices', { organizationId: 1000001 });
     const text = json?.result?.content?.[0]?.text ?? '';
     return `passedGate=${!text.includes('Forbidden')} notAuthError=${json?.error === undefined}`;
   });
 
   await check('READ with public-URL audience (accepted)', async () => {
-    const { json } = await callTool(publicUrlAudience, 'get_invoices', { organizationId: 1234567 });
+    const { json } = await callTool(publicUrlAudience, 'get_invoices', { organizationId: 1000001 });
     const text = json?.result?.content?.[0]?.text ?? '';
     return `passedGate=${!text.includes('Forbidden')} notAuthError=${json?.error === undefined} raw=${JSON.stringify(json).slice(0, 200)}`;
   });
@@ -157,19 +157,19 @@ async function main() {
   });
 
   await check('WRITE with user.read only (denied)', async () => {
-    const { json } = await callTool(readOnly, 'update_subscription_tags', { subscriptionId: 1, tags: { a: 'b' }, organizationId: 1234567 });
+    const { json } = await callTool(readOnly, 'update_subscription_tags', { subscriptionId: 1, tags: { a: 'b' }, organizationId: 1000001 });
     const text = json?.result?.content?.[0]?.text ?? '';
     return `isError=${json?.result?.isError} denied=${text.includes("user.write")} raw=${JSON.stringify(json).slice(0, 300)}`;
   });
 
   await check('WRITE with user.write (allowed)', async () => {
-    const { json } = await callTool(readWrite, 'update_subscription_tags', { subscriptionId: 1, tags: { a: 'b' }, organizationId: 1234567 });
+    const { json } = await callTool(readWrite, 'update_subscription_tags', { subscriptionId: 1, tags: { a: 'b' }, organizationId: 1000001 });
     const text = json?.result?.content?.[0]?.text ?? '';
     return `passedGate=${!text.includes('Forbidden')} notAuthError=${json?.error === undefined}`;
   });
 
   await check('READ with no roles (denied)', async () => {
-    const { json } = await callTool(noRoles, 'get_invoices', { organizationId: 1234567 });
+    const { json } = await callTool(noRoles, 'get_invoices', { organizationId: 1000001 });
     const text = json?.result?.content?.[0]?.text ?? '';
     return `isError=${json?.result?.isError} denied=${text.includes("user.read")} raw=${JSON.stringify(json).slice(0, 300)}`;
   });
@@ -177,7 +177,7 @@ async function main() {
   await check('WRITE with user.write but no user.read (denied)', async () => {
     // user.write does NOT imply user.read — an editor needs both.
     const writeOnly = await signToken({ roles: ['user.write'] });
-    const { json } = await callTool(writeOnly, 'get_invoices', { organizationId: 1234567 });
+    const { json } = await callTool(writeOnly, 'get_invoices', { organizationId: 1000001 });
     const text = json?.result?.content?.[0]?.text ?? '';
     return `isError=${json?.result?.isError} denied=${text.includes('user.read')} raw=${JSON.stringify(json).slice(0, 300)}`;
   });

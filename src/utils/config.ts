@@ -6,6 +6,15 @@ export interface AppConfig {
   port: number;
   host: string;
   nodeEnv: string;
+  /**
+   * Number of reverse-proxy hops to trust when resolving the client IP.
+   *
+   * Required behind an ingress/gateway: without it every request appears to come
+   * from the proxy address, so per-client rate limiting degrades into one shared
+   * bucket and `X-Forwarded-For` handling is unreliable. Kept a number (not
+   * `true`) so a client cannot spoof its own address by prepending headers.
+   */
+  trustProxy: number;
   
   // Authentication
   authEnabled: boolean;
@@ -37,6 +46,12 @@ export interface AppConfig {
   allowedOrganizations: number[];
   /** Organization IDs a write-capable caller may mutate. Empty = all allowed orgs. */
   allowedWriteOrganizations: number[];
+  /**
+   * Explicit opt-in for "an empty ALLOWED_ORGANIZATIONS means no restriction".
+   * Default `false`, so an unset allowlist denies organization-scoped calls
+   * instead of silently granting access to every organization.
+   */
+  allowAllOrganizations: boolean;
   
   // Crayon API
   crayonClientId: string;
@@ -206,6 +221,32 @@ export function loadConfig(): AppConfig {
 
   const allowedOrganizations = parseArrayEnv('ALLOWED_ORGANIZATIONS');
   const allowedWriteOrganizations = parseArrayEnv('ALLOWED_WRITE_ORGANIZATIONS');
+  const allowAllOrganizations = parseBoolEnv('ALLOW_ALL_ORGANIZATIONS', false);
+
+  const nodeEnv = optionalEnv('NODE_ENV', 'development');
+  const isProduction = nodeEnv === 'production';
+
+  // Fail closed on the two switches that disable the security model entirely.
+  // Both are legitimate for local development, neither is safe in production, and
+  // a stray environment value must not be enough to reach either state.
+  if (isProduction && authMode === 'none') {
+    errors.push(
+      'AUTH_MODE resolves to "none" but NODE_ENV is "production". Set AUTH_MODE=entra (or token) and configure the matching credentials — authentication may not be disabled in production.'
+    );
+  }
+
+  // An empty allowlist used to mean "every organization". That is a fail-open
+  // default: forgetting one environment variable silently exposes all customers'
+  // cost data. Deny instead, and require an explicit opt-in to stay open.
+  if (authMode !== 'none' && allowedOrganizations.length === 0 && !allowAllOrganizations) {
+    const message =
+      'ALLOWED_ORGANIZATIONS is empty, so every organization-scoped tool call will be denied. Set the allowlist, or set ALLOW_ALL_ORGANIZATIONS=true to deliberately allow every organization the Crayon credentials can see.';
+    if (isProduction) {
+      errors.push(message);
+    } else {
+      console.warn(`WARNING: ${message}`);
+    }
+  }
 
   // Warn (don't fail) if write orgs are not a subset of read orgs — that would
   // grant write access to an organization the caller cannot even read.
@@ -219,12 +260,29 @@ export function loadConfig(): AppConfig {
     );
   }
   
+  // The base URL receives the Crayon service credentials (Basic auth on
+  // /connect/token) and every request body, so a plain-HTTP endpoint would leak
+  // both. Only loopback may be HTTP, which keeps the local mock server usable.
+  const crayonApiBaseUrl = optionalEnv('CRAYON_API_BASE_URL', 'https://api.crayon.com/api/v1');
+  try {
+    const parsed = new URL(crayonApiBaseUrl);
+    const isLoopback = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(parsed.hostname);
+    if (parsed.protocol !== 'https:' && !isLoopback) {
+      errors.push(`CRAYON_API_BASE_URL must use https (got ${parsed.protocol}//${parsed.hostname}); Crayon credentials travel to this host`);
+    }
+  } catch {
+    errors.push(`Invalid CRAYON_API_BASE_URL: ${crayonApiBaseUrl}. Expected an absolute URL`);
+  }
+
   // Build configuration
   const config: AppConfig = {
     // Server
     port: parseIntEnv('PORT', 3003),
     host: optionalEnv('HOST', '0.0.0.0'),
-    nodeEnv: optionalEnv('NODE_ENV', 'development'),
+    nodeEnv,
+    // Default to one hop: exactly the ingress that terminates the request. More
+    // hops means trusting more `X-Forwarded-For` entries, i.e. more spoofable.
+    trustProxy: parseIntEnv('TRUST_PROXY', 1),
     
     // Authentication
     authEnabled,
@@ -242,13 +300,14 @@ export function loadConfig(): AppConfig {
 
     allowedOrganizations,
     allowedWriteOrganizations,
+    allowAllOrganizations,
     
     // Crayon API
     crayonClientId: requireEnv('CRAYON_CLIENT_ID'),
     crayonClientSecret: requireEnv('CRAYON_CLIENT_SECRET'),
     crayonUsername: requireEnv('CRAYON_USERNAME'),
     crayonPassword: requireEnv('CRAYON_PASSWORD'),
-    crayonApiBaseUrl: optionalEnv('CRAYON_API_BASE_URL', 'https://api.crayon.com/api/v1'),
+    crayonApiBaseUrl,
     
     // Rate Limiting
     rateLimitWindowMs: parseIntEnv('RATE_LIMIT_WINDOW_MS', 60000),
@@ -273,6 +332,10 @@ export function loadConfig(): AppConfig {
   // Validate port range
   if (config.port < 1 || config.port > 65535) {
     errors.push(`Invalid PORT: ${config.port}. Must be between 1 and 65535`);
+  }
+
+  if (config.trustProxy < 0) {
+    errors.push(`Invalid TRUST_PROXY: ${config.trustProxy}. Must be 0 or greater`);
   }
   
   // Validate percentage

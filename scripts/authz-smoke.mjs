@@ -19,9 +19,9 @@ const child = spawn(process.execPath, ['dist/index.js'], {
     HOST: '127.0.0.1',
     AUTH_MODE: 'token',
     AUTH_TOKEN: TOKEN,
-    ALLOWED_ORGANIZATIONS: '1234567,7654321',
-    // Only 1234567 may be written to; 7654321 is read-only.
-    ALLOWED_WRITE_ORGANIZATIONS: '1234567',
+    ALLOWED_ORGANIZATIONS: '1000001,1000002',
+    // Only 1000001 may be written to; 1000002 is read-only.
+    ALLOWED_WRITE_ORGANIZATIONS: '1000001',
     ENTRA_READ_ROLE: 'user.read',
     ENTRA_WRITE_ROLE: 'user.write',
     CRAYON_CLIENT_ID: 'dummy',
@@ -108,7 +108,7 @@ async function main() {
   // Read tool with an allowed organization -> reaches the Crayon client
   // (dummy creds fail upstream, which proves the gate let it through).
   await check('READ tool (allowed org)', async () => {
-    const { result } = await call(10, 'get_invoices', { organizationId: 1234567 });
+    const { result } = await call(10, 'get_invoices', { organizationId: 1000001 });
     const text = result?.content?.[0]?.text ?? '';
     return `isError=${result?.isError} passedGate=${!text.includes('Forbidden')}`;
   });
@@ -123,7 +123,7 @@ async function main() {
   // Write tool against a read-only organization -> denied by allowlist.
   await check('WRITE tool (read-only org)', async () => {
     const { result } = await call(12, 'update_subscription_tags', {
-      subscriptionId: 1, tags: { Env: 'test' }, organizationId: 7654321,
+      subscriptionId: 1, tags: { Env: 'test' }, organizationId: 1000002,
     });
     const text = result?.content?.[0]?.text ?? '';
     return `isError=${result?.isError} denied=${text.includes('read-only')}`;
@@ -134,6 +134,21 @@ async function main() {
     const { result } = await call(13, 'get_invoices', { organizationId: 9999999 });
     const text = result?.content?.[0]?.text ?? '';
     return `isError=${result?.isError} denied=${text.includes('no access to organization')}`;
+  });
+
+  // Cross-organization tools accept an OPTIONAL organizationId. Omitting it must
+  // not become an implicit "all organizations" query — that turns a scoping
+  // argument into an opt-in the caller can simply leave out.
+  await check('CROSS-ORG tool without organizationId denied', async () => {
+    const { result } = await call(14, 'list_all_subscriptions_with_tags', {});
+    const text = result?.content?.[0]?.text ?? '';
+    return `isError=${result?.isError} denied=${text.includes('requires an organizationId')}`;
+  });
+
+  await check('CROSS-ORG tool with organizationId allowed', async () => {
+    const { result } = await call(15, 'list_all_subscriptions_with_tags', { organizationId: 1000001 });
+    const text = result?.content?.[0]?.text ?? '';
+    return `passedGate=${!text.includes('Forbidden')}`;
   });
 }
 

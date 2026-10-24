@@ -10,7 +10,7 @@
     "dev": "tsc && node dist/index.js",
     "watch": "tsc --watch",
     "clean": "node -e \"fs.rmSync('dist',{recursive:true,force:true})\"",
-    "test:smoke": "npm run build && node scripts/http-smoke.mjs && node scripts/authz-smoke.mjs && node scripts/entra-auth-smoke.mjs",
+    "test:smoke": "npm run build && node scripts/http-smoke.mjs && node scripts/authz-smoke.mjs && node scripts/entra-auth-smoke.mjs && node scripts/config-guard-test.mjs",
     "test:tools": "npm run build && node scripts/tools-api-test.mjs"
   },
   "keywords": [

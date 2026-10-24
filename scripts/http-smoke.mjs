@@ -23,7 +23,7 @@ const child = spawn(process.execPath, ['dist/index.js'], {
     HOST: '127.0.0.1',
     AUTH_MODE: 'token',
     AUTH_TOKEN: TOKEN,
-    ALLOWED_ORGANIZATIONS: '1234567',
+    ALLOWED_ORGANIZATIONS: '1000001',
     CRAYON_CLIENT_ID: 'dummy',
     CRAYON_CLIENT_SECRET: 'dummy',
     CRAYON_USERNAME: 'dummy',
@@ -127,7 +127,7 @@ async function main() {
 
   await check('TOOLS/CALL (chart tool reachable)', async () => {
     const { status, json } = await callTool(3, 'visualize_costs_pie_chart', {
-      organizationId: 1234567, monthsBack: 1, topN: 3,
+      organizationId: 1000001, monthsBack: 1, topN: 3,
     });
     const text = json?.result?.content?.[0]?.text ?? '';
     return `status=${status} isError=${json?.result?.isError} reachedHandler=${text.includes('visualize_costs_pie_chart')}`;
@@ -145,8 +145,11 @@ async function main() {
     return `status=${status} isError=${json?.result?.isError} sanitized=${text.includes('An error occurred processing your request')}`;
   });
 
-  // Legacy clients must be declined with an explicit version error, not served.
-  await check('LEGACY initialize rejected', async () => {
+  // 2025-era clients are served through the SDK's stateless fallback (see the
+  // `legacy: 'stateless'` note in src/index.ts): VS Code's MCP client still uses
+  // that handshake, so rejecting it would break every VS Code connection. This
+  // asserts the fallback stays available rather than the old 'reject' behaviour.
+  await check('LEGACY initialize served by stateless fallback', async () => {
     const r = await fetch(`${BASE}/mcp`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', Authorization: `Bearer ${TOKEN}` },
@@ -156,7 +159,7 @@ async function main() {
       }),
     });
     const json = await readResponse(r);
-    return `status=${r.status} rejected=${/unsupported protocol version/i.test(json?.error?.message ?? '')}`;
+    return `status=${r.status} served=${Boolean(json?.result)} notRejected=${!/unsupported protocol version/i.test(json?.error?.message ?? '')}`;
   });
 
   await check('MISSING Mcp-Method rejected', async () => {
@@ -181,6 +184,45 @@ async function main() {
     const r = await fetch(`${BASE}/metrics`, { headers: { Authorization: `Bearer ${TOKEN}` } });
     const j = await r.json();
     return `status=${r.status} requests=${j.requests}`;
+  });
+
+  // The metrics route is registered AFTER the auth middleware. Express serves in
+  // registration order, so an endpoint declared earlier would bypass the gate —
+  // this asserts the ordering stays correct.
+  await check('METRICS without token rejected', async () => {
+    const r = await fetch(`${BASE}/metrics`);
+    return `status=${r.status} (expect 401)`;
+  });
+
+  // A caller holding no app role must not read operational state either.
+  await check('METRICS with role-less token rejected', async () => {
+    const r = await fetch(`${BASE}/metrics`, { headers: { Authorization: 'Bearer no-roles-token' } });
+    return `status=${r.status} (401 token mode: invalid credential)`;
+  });
+
+  // Malformed JSON used to fall through to Express's default error page, which
+  // reflects the request path and (in development) the stack.
+  await check('MALFORMED JSON is a JSON error, not HTML', async () => {
+    const r = await fetch(`${BASE}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', Authorization: `Bearer ${TOKEN}` },
+      body: '{"jsonrpc": "2.0", broken',
+    });
+    const body = await r.text();
+    return `status=${r.status} json=${body.trim().startsWith('{')} noStack=${!/at .*\.js:\d+/.test(body)}`;
+  });
+
+  // No method — including the legacy `initialize` handshake — is served without
+  // a credential. An anonymous handshake would hand a caller a server instance
+  // and skip the auth discovery the protocol defines.
+  await check('ANONYMOUS initialize rejected', async () => {
+    const r = await fetch(`${BASE}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', 'MCP-Protocol-Version': REVISION, 'Mcp-Method': 'initialize' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 11, method: 'initialize', params: { _meta: envelope } }),
+    });
+    const challenge = r.headers.get('www-authenticate') ?? '';
+    return `status=${r.status} challenge=${challenge ? 'sent' : 'MISSING'}`;
   });
 }
 
